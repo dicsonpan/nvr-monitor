@@ -1,0 +1,1152 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NVR 监控中心</title>
+<meta name="description" content="NVR 监控中心 — 基于 ARM 单板机的轻量监控录像与实时预览">
+<!-- 浏览器标签页图标：奶油底立方体标记，浅色/深色标签栏都能看清 -->
+<link rel="icon" type="image/png" sizes="32x32" href="/static/favicon-32.png">
+<link rel="icon" type="image/png" sizes="64x64" href="/static/favicon-64.png">
+<link rel="icon" type="image/png" sizes="512x512" href="/static/favicon-512.png">
+<link rel="apple-touch-icon" sizes="180x180" href="/static/apple-touch-icon.png">
+<link rel="mask-icon" href="/static/favicon-512.png" color="#3b82f6">
+<meta name="theme-color" content="#080b10">
+<!-- hls.js 已下载到板子本地 /opt/nvr/bin/static/, 不依赖公网 CDN -->
+<script src="/static/hls.min.js"></script>
+<style>
+/* ══════════════ 设计系统 ══════════════ */
+:root{
+  /* 背景层次 */
+  --bg:#080b10;
+  --bg-grad-a:#0d1219;
+  --bg-grad-b:#080b10;
+  --surface:#11161f;
+  --surface-2:#161d28;
+  --surface-3:#1c242f;
+
+  /* 描边 */
+  --line:rgba(255,255,255,.07);
+  --line-2:rgba(255,255,255,.12);
+  --line-3:rgba(255,255,255,.2);
+
+  /* 文字 */
+  --tx:#e8edf4;
+  --tx-2:#9aa7b8;
+  --tx-3:#66707e;
+
+  /* 主题色 */
+  --ac:#3b82f6;
+  --ac-2:#60a5fa;
+  --ac-dim:rgba(59,130,246,.14);
+  --live:#22c55e;
+  --live-dim:rgba(34,197,94,.15);
+  --warn:#f59e0b;
+  --warn-dim:rgba(245,158,11,.15);
+  --err:#ef4444;
+  --err-dim:rgba(239,68,68,.15);
+
+  --r-sm:6px;--r:9px;--r-lg:13px;
+  --sh:0 2px 8px rgba(0,0,0,.3);
+  --sh-lg:0 8px 28px rgba(0,0,0,.5);
+  --mono:'SF Mono',ui-monospace,'Cascadia Code',Menlo,Consolas,monospace;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{
+  font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif;
+  background:var(--bg);
+  background-image:
+    radial-gradient(1100px 620px at 12% -8%,rgba(59,130,246,.10),transparent 62%),
+    radial-gradient(900px 560px at 92% 4%,rgba(34,197,94,.055),transparent 60%),
+    linear-gradient(178deg,var(--bg-grad-a),var(--bg-grad-b) 46%);
+  background-attachment:fixed;
+  color:var(--tx);
+  line-height:1.55;
+  min-height:100vh;
+  -webkit-font-smoothing:antialiased;
+}
+::-webkit-scrollbar{width:9px;height:9px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:rgba(255,255,255,.11);border-radius:5px}
+::-webkit-scrollbar-thumb:hover{background:rgba(255,255,255,.19)}
+
+/* ══════════════ 顶栏 ══════════════ */
+.top{
+  position:sticky;top:0;z-index:60;
+  background:rgba(10,14,20,.82);
+  backdrop-filter:blur(20px) saturate(160%);
+  -webkit-backdrop-filter:blur(20px) saturate(160%);
+  border-bottom:1px solid var(--line);
+}
+.top-in{
+  max-width:1800px;margin:0 auto;padding:13px 24px;
+  display:flex;align-items:center;justify-content:space-between;gap:20px;flex-wrap:wrap;
+}
+.brand{display:flex;align-items:center;gap:13px;min-width:0}
+/* 官方 logo: 深色底用反白版(logo-light.png), 字标已变白、彩描边保留 */
+.brand-logo{height:38px;width:auto;display:block;flex:0 0 auto}
+.brand-div{width:1px;height:26px;background:var(--line-2);flex:0 0 auto}
+.brand h1{font-size:16px;font-weight:650;letter-spacing:.2px;line-height:1.25}
+.brand .sub{font-size:11.5px;color:var(--tx-3);letter-spacing:.3px;margin-top:1px}
+
+.meters{display:flex;align-items:center;gap:9px;flex-wrap:wrap}
+.mt{
+  display:flex;flex-direction:column;gap:1px;
+  padding:6px 13px;border-radius:var(--r-sm);
+  background:rgba(255,255,255,.035);
+  border:1px solid var(--line);
+  min-width:74px;
+}
+.mt .k{font-size:9.5px;color:var(--tx-3);letter-spacing:.7px;text-transform:uppercase;font-weight:600}
+.mt .v{font-size:13px;font-weight:600;font-variant-numeric:tabular-nums;letter-spacing:.2px}
+.mt.ok .v{color:var(--live)} .mt.warn .v{color:var(--warn)} .mt.crit .v{color:var(--err)}
+
+/* ══ 系统资源面板 ══ */
+.mt.res{padding:0;position:relative;min-width:0}
+.res-toggle{
+  display:flex;align-items:center;gap:9px;
+  padding:6px 12px;border:0;background:transparent;cursor:pointer;
+  font-family:inherit;color:inherit;border-radius:var(--r-sm);
+  transition:background .16s;
+}
+.res-toggle:hover{background:rgba(255,255,255,.05)}
+.res-ico{display:grid;place-items:center;width:15px;height:15px;flex:none}
+.res-ico svg{width:15px;height:15px;fill:var(--tx-3);transition:fill .16s}
+.mt.res:hover .res-ico svg{fill:var(--ac-2)}
+.res-mini{display:flex;align-items:center;gap:9px;font-variant-numeric:tabular-nums}
+.res-mini b{font-size:12.5px;font-weight:650;color:var(--tx)}
+.res-mini i{font-size:11.5px;font-style:normal;color:var(--tx-3)}
+.res-mini b.warn{color:var(--warn)} .res-mini b.crit{color:var(--err)}
+.res-mini i.warn{color:var(--warn)} .res-mini i.crit{color:var(--err)}
+.res-caret{display:grid;place-items:center;transition:transform .24s}
+.res-caret svg{width:13px;height:13px;fill:var(--tx-3)}
+.mt.res.open .res-caret{transform:rotate(180deg)}
+.mt.res.open{border-color:var(--line-2);background:rgba(255,255,255,.05)}
+
+.res-pop{
+  position:absolute;top:calc(100% + 9px);right:0;width:326px;z-index:70;
+  background:rgba(17,22,31,.97);
+  backdrop-filter:blur(20px) saturate(160%);
+  -webkit-backdrop-filter:blur(20px) saturate(160%);
+  border:1px solid var(--line-2);border-radius:var(--r-lg);
+  box-shadow:var(--sh-lg);
+  padding:14px 15px;display:none;
+}
+.mt.res.open .res-pop{display:block;animation:pop .16s ease-out}
+@keyframes pop{from{opacity:0;transform:translateY(-5px)}to{opacity:1;transform:none}}
+.res-hd{font-size:11px;font-weight:680;letter-spacing:.8px;text-transform:uppercase;
+  color:var(--tx-3);margin-bottom:11px;padding-bottom:9px;border-bottom:1px solid var(--line)}
+.res-rows{display:flex;flex-direction:column;gap:11px}
+.res-row .r-top{display:flex;align-items:baseline;justify-content:space-between;gap:10px;margin-bottom:5px}
+.res-row .r-k{font-size:12px;color:var(--tx-2);display:flex;align-items:center;gap:6px}
+.res-row .r-k svg{width:12px;height:12px;fill:var(--tx-3);flex:none}
+.res-row .r-v{font-size:12px;font-weight:650;font-variant-numeric:tabular-nums;color:var(--tx)}
+.res-row .r-v.warn{color:var(--warn)} .res-row .r-v.crit{color:var(--err)}
+.res-row .r-x{font-size:10.5px;color:var(--tx-3);font-weight:500;margin-left:4px}
+.rbar{height:4px;border-radius:2px;background:rgba(255,255,255,.07);overflow:hidden;position:relative}
+.rbar>i{display:block;height:100%;border-radius:2px;background:var(--ac);
+  transition:width .5s cubic-bezier(.4,0,.2,1)}
+.rbar>i.ok{background:var(--live)} .rbar>i.warn{background:var(--warn)} .rbar>i.crit{background:var(--err)}
+.rbar>i.grad{background:linear-gradient(90deg,#3b82f6,#22c55e)}
+.rbar>u{position:absolute;top:-2px;width:1px;height:8px;background:var(--tx-3);opacity:.55}
+.res-note{
+  margin-top:12px;padding-top:10px;border-top:1px solid var(--line);
+  font-size:11px;color:var(--tx-3);line-height:1.65;
+}
+.res-note b{color:var(--tx-2);font-weight:600}
+.res-note .hot{color:var(--warn)}
+
+/* ══════════════ 标签页 ══════════════ */
+.tabs{
+  max-width:1800px;margin:0 auto;padding:0 24px;
+  display:flex;gap:5px;border-bottom:1px solid var(--line);
+}
+.tab{
+  position:relative;padding:13px 20px;
+  font-size:13.5px;font-weight:550;color:var(--tx-3);
+  cursor:pointer;transition:color .18s;user-select:none;
+  display:flex;align-items:center;gap:8px;
+}
+.tab svg{width:15px;height:15px;fill:currentColor;opacity:.85}
+.tab::after{
+  content:'';position:absolute;left:14px;right:14px;bottom:-1px;height:2px;
+  background:var(--ac);border-radius:2px 2px 0 0;
+  transform:scaleX(0);transition:transform .24s cubic-bezier(.4,0,.2,1);
+}
+.tab:hover{color:var(--tx-2)}
+.tab.on{color:var(--tx)}
+.tab.on::after{transform:scaleX(1)}
+.tab .cnt{
+  font-size:10px;padding:1px 6px;border-radius:9px;
+  background:var(--ac-dim);color:var(--ac-2);font-weight:650;
+  font-variant-numeric:tabular-nums;
+}
+
+.wrap{max-width:1800px;margin:0 auto;padding:20px 24px 44px}
+.hide{display:none!important}
+
+/* ══════════════ 工具条 ══════════════ */
+.bar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:16px}
+.grp{display:flex;background:rgba(255,255,255,.035);border:1px solid var(--line);border-radius:var(--r);padding:3px;gap:2px}
+.gbtn{
+  padding:6px 13px;border-radius:var(--r-sm);border:0;background:transparent;
+  color:var(--tx-3);font-size:12.5px;font-weight:550;cursor:pointer;transition:.16s;
+  font-family:inherit;display:flex;align-items:center;gap:6px;white-space:nowrap;
+}
+.gbtn svg{width:13px;height:13px;fill:currentColor;opacity:.8}
+.gbtn:hover{color:var(--tx-2);background:rgba(255,255,255,.05)}
+.gbtn.on{background:var(--ac);color:#fff;box-shadow:0 2px 8px rgba(59,130,246,.34)}
+.gbtn.on svg{opacity:1}
+.gbtn.danger:hover{background:var(--err-dim);color:var(--err)}
+.bar .note{font-size:11.5px;color:var(--tx-3);margin-left:auto;text-align:right;line-height:1.5}
+
+/* ══════════════ 实时宫格 ══════════════ */
+.grid{display:grid;gap:13px;grid-template-columns:repeat(3,1fr);transition:grid-template-columns .3s}
+.g2{grid-template-columns:repeat(2,1fr)}
+.g4{grid-template-columns:repeat(4,1fr)}
+.g6{grid-template-columns:repeat(6,1fr)}
+
+.cam{
+  position:relative;background:var(--surface);
+  border:1px solid var(--line);border-radius:var(--r-lg);
+  overflow:hidden;cursor:pointer;
+  transition:border-color .2s,transform .2s,box-shadow .2s;
+}
+.cam:hover{border-color:var(--line-3);transform:translateY(-2px);box-shadow:var(--sh-lg)}
+.cam.big{grid-column:span 2;grid-row:span 2;border-color:var(--ac)}
+.cam.big:hover{transform:none}
+
+/* 容器比例由 JS 按摄像头实际分辨率设置(见 setStageAR)。
+   16:9 的子码流不会有多余黑边; 若相机仍是 704x576 之类非 16:9,
+   仍按真实比例显示, 不拉伸变形。 */
+.stage{position:relative;width:100%;background:#000;aspect-ratio:var(--ar,16/9)}
+.stage video{
+  width:100%;height:100%;display:block;object-fit:contain;background:#000;
+  opacity:0;transition:opacity .5s;
+}
+.stage video.on{opacity:1}
+/* 扫描线质感 */
+.stage::after{
+  content:'';position:absolute;inset:0;pointer-events:none;
+  background:repeating-linear-gradient(0deg,rgba(0,0,0,.11) 0 1px,transparent 1px 3px);
+  opacity:.5;mix-blend-mode:multiply;
+}
+
+.ov{position:absolute;inset:0;pointer-events:none}
+.ov-t,.ov-b{
+  position:absolute;left:0;right:0;display:flex;align-items:center;gap:8px;
+  padding:9px 11px;
+}
+.ov-t{top:0;background:linear-gradient(180deg,rgba(0,0,0,.82),transparent)}
+.ov-b{bottom:0;background:linear-gradient(0deg,rgba(0,0,0,.82),transparent);padding-bottom:10px}
+.ov-t{justify-content:space-between;align-items:flex-start}
+.ov-b{justify-content:space-between;align-items:flex-end}
+.nm{font-size:12.5px;font-weight:650;text-shadow:0 1px 4px rgba(0,0,0,.9);letter-spacing:.2px}
+.zn{font-size:10px;color:rgba(255,255,255,.62);text-shadow:0 1px 3px rgba(0,0,0,.9)}
+.badge{
+  display:flex;align-items:center;gap:5px;
+  font-size:9.5px;font-weight:700;letter-spacing:.7px;
+  padding:3px 8px;border-radius:20px;white-space:nowrap;
+  background:rgba(0,0,0,.62);backdrop-filter:blur(6px);border:1px solid var(--line-2);
+}
+.badge .dot{width:5px;height:5px;border-radius:50%;background:currentColor;flex:none}
+.badge.live{color:var(--live);border-color:rgba(34,197,94,.4)}
+.badge.live .dot{animation:blink 1.5s ease-in-out infinite}
+.badge.load{color:var(--warn);border-color:rgba(245,158,11,.4)}
+.badge.off{color:var(--err);border-color:rgba(239,68,68,.4)}
+.badge.idle{color:var(--tx-3)}
+@keyframes blink{0%,100%{opacity:1;box-shadow:0 0 0 0 currentColor}50%{opacity:.35}}
+.ip{font-family:var(--mono);font-size:9.5px;color:rgba(255,255,255,.55);text-shadow:0 1px 3px rgba(0,0,0,.9)}
+.clk{font-family:var(--mono);font-size:10px;color:rgba(255,255,255,.7);text-shadow:0 1px 3px rgba(0,0,0,.9);letter-spacing:.4px}
+
+.ph{
+  position:absolute;inset:0;display:flex;flex-direction:column;
+  align-items:center;justify-content:center;gap:9px;
+  background:linear-gradient(160deg,#0e131a,#0a0e14);
+  color:var(--tx-3);font-size:12px;text-align:center;padding:16px;
+}
+.ph svg{width:26px;height:26px;fill:var(--tx-3);opacity:.5}
+.ph.err svg{fill:var(--err);opacity:.75}
+.ring{
+  width:24px;height:24px;border-radius:50%;
+  border:2px solid rgba(255,255,255,.09);border-top-color:var(--ac);
+  animation:spin .78s linear infinite;
+}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+.rbtn{
+  position:absolute;right:9px;bottom:9px;z-index:4;
+  display:flex;align-items:center;gap:5px;
+  background:rgba(8,11,16,.8);backdrop-filter:blur(8px);
+  border:1px solid var(--line-2);color:rgba(255,255,255,.85);
+  font-size:10.5px;font-weight:550;padding:4px 10px;
+  border-radius:20px;cursor:pointer;transition:.16s;font-family:inherit;
+  opacity:0;transform:translateY(4px);
+}
+.cam:hover .rbtn{opacity:1;transform:none}
+.rbtn:hover{background:var(--ac);border-color:var(--ac);color:#fff}
+.rbtn svg{width:11px;height:11px;fill:currentColor}
+.mbtn{
+  position:absolute;right:9px;bottom:9px;z-index:4;
+  width:26px;height:26px;border-radius:50%;
+  background:rgba(8,11,16,.8);backdrop-filter:blur(8px);
+  border:1px solid var(--line-2);color:rgba(255,255,255,.85);
+  display:grid;place-items:center;cursor:pointer;transition:.16s;
+  opacity:0;transform:translateY(4px);
+}
+.cam:hover .mbtn{opacity:1;transform:none}
+.mbtn:hover{background:var(--ac);border-color:var(--ac);color:#fff}
+.mbtn svg{width:13px;height:13px;fill:currentColor}
+
+/* ══════════════ 面板 ══════════════ */
+.panel{
+  background:var(--surface);border:1px solid var(--line);
+  border-radius:var(--r-lg);padding:18px;margin-bottom:16px;
+}
+/* 回放页摄像头选择器 */
+.picks{display:grid;grid-template-columns:repeat(auto-fill,minmax(158px,1fr));gap:9px}
+.pick{
+  display:flex;align-items:center;gap:9px;
+  padding:10px 12px;border-radius:var(--r);
+  background:rgba(255,255,255,.028);border:1px solid var(--line);
+  cursor:pointer;transition:.16s;font-family:inherit;text-align:left;
+  color:inherit;width:100%;
+}
+.pick:hover{background:rgba(255,255,255,.06);border-color:var(--line-2);transform:translateY(-1px)}
+.pick.on{background:var(--ac-dim);border-color:var(--ac);box-shadow:0 0 0 3px rgba(59,130,246,.1)}
+.pick .pk{width:30px;height:30px;border-radius:8px;flex:none;
+  display:grid;place-items:center;font-size:12px;font-weight:700;
+  background:rgba(255,255,255,.07);color:var(--tx-2)}
+.pick.on .pk{background:var(--ac);color:#fff}
+.pick .pt{min-width:0;flex:1}
+.pick .pn{font-size:12.5px;font-weight:620;letter-spacing:.2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.pick .pz{font-size:10.5px;color:var(--tx-3);margin-top:1px;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.pick .pc{font-size:10px;padding:1px 6px;border-radius:9px;font-weight:650;flex:none;
+  font-variant-numeric:tabular-nums}
+.pick .pc.has{background:var(--ac-dim);color:#93c5fd}
+.pick .pc.none{background:rgba(255,255,255,.06);color:var(--tx-3)}
+@media(max-width:640px){.picks{grid-template-columns:repeat(2,1fr)}}
+
+/* 未播放的摄像头占位卡片 */
+.ph.slotph{cursor:pointer;transition:.18s;background:rgba(255,255,255,.02)}
+.ph.slotph:hover{background:rgba(255,255,255,.05)}
+.sl-ico{width:34px;height:34px;border-radius:50%;display:grid;place-items:center;
+  background:rgba(59,130,246,.13);margin-bottom:9px;transition:.18s}
+.sl-ico svg{width:15px;height:15px;fill:#60a5fa}
+.ph.slotph:hover .sl-ico{background:var(--ac);transform:scale(1.08)}
+.ph.slotph:hover .sl-ico svg{fill:#fff}
+.sl-t{font-size:12px;font-weight:600;color:var(--tx-2);margin-bottom:3px}
+.sl-s{font-size:10.5px;color:var(--tx-3)}
+.badge:not(.live):not(.warn):not(.crit){background:rgba(255,255,255,.06);color:var(--tx-3)}
+
+.panel:last-child{margin-bottom:0}
+.p-hd{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;flex-wrap:wrap;margin-bottom:14px}
+.p-hd h2{font-size:14.5px;font-weight:640;letter-spacing:.2px;display:flex;align-items:center;gap:8px}
+.p-hd h2 svg{width:15px;height:15px;fill:var(--ac);flex:none}
+.p-sub{font-size:11.5px;color:var(--tx-3);margin-top:3px}
+
+select,input[type=date]{
+  background:var(--surface-3);border:1px solid var(--line-2);color:var(--tx);
+  padding:6px 11px;border-radius:var(--r-sm);font-size:12.5px;
+  font-family:inherit;cursor:pointer;transition:.16s;
+}
+select:hover{border-color:var(--line-3)}
+select:focus{outline:none;border-color:var(--ac);box-shadow:0 0 0 3px var(--ac-dim)}
+option{background:#161d28;color:var(--tx)}
+
+/* 时间轴 */
+.tl{display:flex;flex-wrap:wrap;gap:4px}
+.tl-h{
+  width:100%;font-size:10px;color:var(--tx-3);letter-spacing:.9px;
+  font-weight:650;margin:9px 0 2px;text-transform:uppercase;
+  display:flex;align-items:center;gap:9px;
+}
+.tl-h::after{content:'';flex:1;height:1px;background:var(--line)}
+.tl-h:first-child{margin-top:0}
+.slot{
+  width:54px;height:33px;border-radius:var(--r-sm);
+  border:1px solid var(--line);background:rgba(255,255,255,.022);
+  font-size:10.5px;color:var(--tx-3);font-variant-numeric:tabular-nums;
+  display:flex;align-items:center;justify-content:center;
+  cursor:default;transition:.14s;letter-spacing:.2px;
+}
+.slot.has{
+  background:linear-gradient(180deg,rgba(59,130,246,.26),rgba(59,130,246,.15));
+  border-color:rgba(59,130,246,.5);color:#93c5fd;font-weight:600;cursor:pointer;
+}
+.slot.has:hover{background:rgba(59,130,246,.36);border-color:var(--ac);transform:translateY(-1px);box-shadow:0 3px 10px rgba(59,130,246,.28)}
+.slot.live{
+  background:linear-gradient(180deg,rgba(34,197,94,.24),rgba(34,197,94,.13));
+  border-color:rgba(34,197,94,.45);color:#86efac;font-weight:600;
+}
+.slot.cur{outline:2px solid var(--ac);outline-offset:2px}
+
+.lg{display:flex;gap:16px;font-size:11.5px;color:var(--tx-3);flex-wrap:wrap;align-items:center;margin-top:14px}
+.lg span{display:flex;align-items:center;gap:6px}
+.lg i{width:11px;height:11px;border-radius:3px;flex:none}
+
+/* 播放器 */
+.pv{
+  background:#000;border-radius:var(--r-lg);overflow:hidden;
+  margin-bottom:16px;border:1px solid var(--line-2);box-shadow:var(--sh-lg);
+}
+.pv video{width:100%;display:block;max-height:min(62vh,560px);object-fit:contain;background:#000}
+
+table{width:100%;border-collapse:collapse;font-size:12.5px}
+th,td{padding:9px 11px;border-bottom:1px solid var(--line);text-align:left}
+th{
+  font-size:10.5px;color:var(--tx-3);font-weight:650;letter-spacing:.7px;
+  text-transform:uppercase;background:rgba(255,255,255,.022);
+  position:sticky;top:0;backdrop-filter:blur(8px);
+}
+th:first-child{border-radius:var(--r-sm) 0 0 0}
+th:last-child{border-radius:0 var(--r-sm) 0 0}
+tbody tr{cursor:pointer;transition:background .13s}
+tbody tr:hover{background:rgba(59,130,246,.07)}
+tbody tr.on{background:var(--ac-dim)}
+td{color:var(--tx-2)}
+td.num{text-align:right;font-variant-numeric:tabular-nums}
+.tg{font-size:10px;padding:2.5px 8px;border-radius:20px;font-weight:650;letter-spacing:.3px;white-space:nowrap}
+.tg.r{background:var(--ac-dim);color:#93c5fd}
+.tg.l{background:var(--live-dim);color:#86efac}
+a.dl{
+  color:var(--ac-2);text-decoration:none;font-weight:600;font-size:11.5px;
+  padding:4px 10px;border-radius:20px;border:1px solid rgba(59,130,246,.3);
+  transition:.15s;display:inline-flex;align-items:center;gap:5px;white-space:nowrap;
+}
+a.dl:hover{background:var(--ac);color:#fff;border-color:var(--ac)}
+a.dl svg{width:11px;height:11px;fill:currentColor}
+
+.empty{padding:44px 20px;text-align:center;color:var(--tx-3);font-size:13px}
+.empty svg{width:38px;height:38px;fill:var(--tx-3);opacity:.35;margin-bottom:12px}
+.empty .t{color:var(--tx-2);font-weight:600;margin-bottom:4px;font-size:13.5px}
+.empty .s{font-size:11.5px}
+
+/* 统计条 */
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px;margin-bottom:16px}
+.st{
+  background:var(--surface);border:1px solid var(--line);
+  border-radius:var(--r);padding:12px 14px;
+}
+.st .k{font-size:10px;color:var(--tx-3);letter-spacing:.7px;font-weight:650;text-transform:uppercase}
+.st .v{font-size:19px;font-weight:680;margin-top:3px;font-variant-numeric:tabular-nums;letter-spacing:-.3px}
+.st .u{font-size:11px;color:var(--tx-3);font-weight:500;margin-left:2px}
+.st.a .v{color:var(--ac-2)} .st.g .v{color:var(--live)}
+
+.foot{text-align:center;font-size:11px;color:var(--tx-3);padding:26px 0 6px;line-height:1.8}
+.foot code{font-family:var(--mono);background:rgba(255,255,255,.05);padding:1px 6px;border-radius:4px;color:var(--tx-2)}
+
+@media(max-width:1200px){.grid,.g4,.g6{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:680px){
+  .top-in{padding:11px 15px}.tabs{padding:0 15px}.wrap{padding:15px 15px 34px}
+  .grid,.g2,.g4,.g6{grid-template-columns:1fr}
+  .cam.big{grid-column:span 1;grid-row:span 1}
+  .brand h1{font-size:14px}.meters{width:100%;justify-content:space-between}
+  .brand-logo{height:28px}.brand-div{height:20px}
+  .res-pop{position:fixed;left:12px;right:12px;top:auto;bottom:12px;width:auto}
+  .bar .note{margin-left:0;text-align:left;width:100%}
+  .tab span.t{display:none}
+}
+</style>
+</head>
+<body>
+
+<div class="top">
+  <div class="top-in">
+    <div class="brand">
+      
+      <span class="brand-div"></span>
+      <div>
+        <h1>NVR 监控中心</h1>
+        <div class="sub">10 路监控 · 实时预览与录像回放</div>
+      </div>
+    </div>
+    <div class="meters">
+      <div class="mt"><div class="k">系统时间</div><div class="v" id="mClock">--:--:--</div></div>
+      <div class="mt" id="mDiskBox"><div class="k">录像盘</div><div class="v" id="mDisk">--</div></div>
+      <div class="mt" id="mStrBox"><div class="k">实时转码</div><div class="v" id="mStr">0/4</div></div>
+
+      <!-- 系统资源: 默认收起成一条状态条, 点击展开完整指标 -->
+      <div class="mt res" id="resBox">
+        <button class="res-toggle" id="resToggle" title="点击展开系统资源详情">
+          <span class="res-ico"><svg viewBox="0 0 24 24"><path d="M3 13h4l2.5-7 4 14L16 13h5v2h-6.4l-1.6 4.6L6 6.8 4.6 15H3z"/></svg></span>
+          <span class="res-mini">
+            <b id="rCpu">--%</b>
+            <i id="rTemp">--°</i>
+            <i id="rMem">--%</i>
+          </span>
+          <span class="res-caret"><svg viewBox="0 0 24 24"><path d="M12 15.5 5.5 9l1.4-1.4L12 12.7l5.1-5.1L18.5 9z"/></svg></span>
+        </button>
+        <div class="res-pop" id="resPop">
+          <div class="res-hd">板子资源占用</div>
+          <div class="res-rows" id="resRows"></div>
+          <div class="res-note" id="resNote"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="tabs">
+    <div class="tab on" data-t="live"><svg viewBox="0 0 24 24"><path d="M12 6.5A5.5 5.5 0 1 0 17.5 12 5.5 5.5 0 0 0 12 6.5Zm0 9A3.5 3.5 0 1 1 15.5 12 3.5 3.5 0 0 1 12 15.5Z"/><circle cx="12" cy="12" r="1.6"/></svg><span class="t">实时监控</span><span class="cnt" id="cLive">0</span></div>
+    <div class="tab" data-t="play"><svg viewBox="0 0 24 24"><path d="M5 4.5A1.5 1.5 0 0 1 6.5 3h11A1.5 1.5 0 0 1 19 4.5v15a1.5 1.5 0 0 1-1.5 1.5h-11A1.5 1.5 0 0 1 5 19.5Zm2 3.2v9l7.5-4.5Z"/></svg><span class="t">录像回放</span></div>
+  </div>
+</div>
+
+<div class="wrap">
+  <!-- ═══════ 实时 ═══════ -->
+  <section id="vLive">
+    <div class="bar">
+      <div class="grp">
+        <button class="gbtn on" data-g="g3"><svg viewBox="0 0 24 24"><path d="M3 3h8v8H3zm10 0h8v8h-8zM3 13h8v8H3zm10 0h8v8h-8z"/></svg>三列</button>
+        <button class="gbtn" data-g="g2"><svg viewBox="0 0 24 24"><path d="M3 4h18v16H3zm1 1v14h16V5z"/></svg>2×2</button>
+        <button class="gbtn" data-g="g4"><svg viewBox="0 0 24 24"><path d="M3 3h18v18H3zm1 1v16h16V4z"/><path d="M12 4v16M4 12h16" stroke="#0a0e14" stroke-width="1.4"/></svg>四列</button>
+        <button class="gbtn" data-g="g6"><svg viewBox="0 0 24 24"><path d="M2 4h20v16H2z" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M2 9.3h20M2 14.7h20M8.7 4v16M15.3 4v16" stroke="currentColor" stroke-width="1.2"/></svg>六分</button>
+      </div>
+      <div class="grp">
+        <button class="gbtn danger" id="bStop"><svg viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>全部停止</button>
+      </div>
+      <div class="note">
+        点击画面放大 · 同时最多 <b style="color:var(--tx-2)">4 路</b>转码（板子 CPU 限制，看完自动释放）<br>
+        子码流 <b style="color:var(--tx-2)">800×448 (16:9)</b>，按实际分辨率显示，不裁切不变形
+      </div>
+    </div>
+    <div class="grid" id="grid"></div>
+  </section>
+
+  <!-- ═══════ 回放 ═══════ -->
+  <section id="vPlay" class="hide">
+    <div class="stats" id="pStats"></div>
+
+    <!-- 摄像头选择: 回放页必须能直接选, 不能强制先回实时页 -->
+    <div class="panel">
+      <div class="p-hd" style="margin-bottom:12px">
+        <div>
+          <h2><svg viewBox="0 0 24 24"><path d="M4 6h11a2 2 0 0 1 2 2v1.5l4.2-2.6a.8.8 0 0 1 1.3.65v8.9a.8.8 0 0 1-1.3.65L17 14.5V16a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2Z"/></svg>选择摄像头</h2>
+          <div class="p-sub">点下方任意一路，即可查看它的历史录像</div>
+        </div>
+      </div>
+      <div class="picks" id="picks"></div>
+    </div>
+
+    <div class="panel">
+      <div class="p-hd">
+        <div>
+          <h2><svg viewBox="0 0 24 24"><path d="M12 6.5A5.5 5.5 0 1 0 17.5 12 5.5 5.5 0 0 0 12 6.5Zm0 9A3.5 3.5 0 1 1 15.5 12 3.5 3.5 0 0 1 12 15.5Z"/><circle cx="12" cy="12" r="1.6"/></svg><span id="pTitle">未选择</span></h2>
+          <div class="p-sub" id="pHint">先在上面选一路摄像头</div>
+        </div>
+        <div style="display:flex;align-items:center;gap:9px">
+          <span style="font-size:11.5px;color:var(--tx-3)">日期</span>
+          <select id="dSel"></select>
+        </div>
+      </div>
+      <div class="tl" id="tl"></div>
+      <div class="lg">
+        <span><i style="background:rgba(59,130,246,.5);border:1px solid rgba(59,130,246,.7)"></i>可回放</span>
+        <span><i style="background:rgba(34,197,94,.45);border:1px solid rgba(34,197,94,.65)"></i>正在录制</span>
+        <span style="margin-left:auto">仅显示有录像的时段 · 悬停查看实际起止时间</span>
+      </div>
+    </div>
+
+    <div class="pv hide" id="pv"><video id="rv" controls preload="metadata" playsinline></video></div>
+
+    <div class="panel">
+      <div class="p-hd" style="margin-bottom:12px">
+        <div>
+          <h2><svg viewBox="0 0 24 24"><path d="M5 4.5A1.5 1.5 0 0 1 6.5 3h11A1.5 1.5 0 0 1 19 4.5v15a1.5 1.5 0 0 1-1.5 1.5h-11A1.5 1.5 0 0 1 5 19.5Zm2 3.2v9l7.5-4.5Z"/></svg><span id="plT">未选择片段</span></h2>
+          <div class="p-sub" id="plM">从上方时间轴选择一个片段开始回放</div>
+        </div>
+        <a class="dl hide" id="plD" download><svg viewBox="0 0 24 24"><path d="M12 3v10.6l3.3-3.3 1.4 1.4L11 17.4 5.3 11.7l1.4-1.4L10 13.6V3zM4 19h16v2H4z"/></svg>下载此片段</a>
+      </div>
+      <div id="listWrap" class="hide">
+        <table>
+          <thead><tr><th>开始时间</th><th>时长</th><th>分辨率</th><th>编码</th><th class="num">大小</th><th></th></tr></thead>
+          <tbody id="tb"></tbody>
+        </table>
+      </div>
+      <div class="empty" id="pEmpty">
+        <svg viewBox="0 0 24 24"><path d="M12 2a10 10 0 1 0 10 10A10 10 0 0 0 12 2Zm0 18a8 8 0 1 1 8-8 8 8 0 0 1-8 8Zm1-13h-2v6h2zm0 8h-2v2h2z"/></svg>
+        <div class="t">请先选择一路摄像头</div>
+        <div class="s">在上方「选择摄像头」中点任意一路，即可查看它的历史录像</div>
+      </div>
+    </div>
+  </section>
+
+  <div class="foot">
+    10 分钟自动切片 · 磁盘满自动滚动删除最旧片段 · 零转码原画质存档<br>
+    板子 <code>192.168.1.20</code> &nbsp;·&nbsp; Web 端口 <code>80</code>
+  </div>
+</div>
+
+<script>
+const $=(s,r=document)=>r.querySelector(s), $$=(s,r=document)=>[...r.querySelectorAll(s)];
+const pad=n=>String(n).padStart(2,'0');
+const hhmm=s=>s.slice(0,2)+':'+s.slice(2,4);
+const dstr=s=>s.slice(0,4)+'-'+s.slice(4,6)+'-'+s.slice(6,8);
+const ICO={
+  play:'<svg viewBox="0 0 24 24"><path d="M5 4.5A1.5 1.5 0 0 1 6.5 3h11A1.5 1.5 0 0 1 19 4.5v15a1.5 1.5 0 0 1-1.5 1.5h-11A1.5 1.5 0 0 1 5 19.5Zm2 3.2v9l7.5-4.5Z"/></svg>',
+  dl:'<svg viewBox="0 0 24 24"><path d="M12 3v10.6l3.3-3.3 1.4 1.4L11 17.4 5.3 11.7l1.4-1.4L10 13.6V3zM4 19h16v2H4z"/></svg>',
+  min:'<svg viewBox="0 0 24 24"><path d="M5 11h14v2H5z"/></svg>',
+  off:'<svg viewBox="0 0 24 24"><path d="M3.3 4.7 4.7 3.3l16 16-1.4 1.4-3.1-3.1A9.9 9.9 0 0 1 12 18a10 10 0 0 1-8.7-15L1.9 4.7Zm10.3 4.4 5.6 5.6A5.9 5.9 0 0 0 13.7 9.1ZM12 4a10 10 0 0 1 10 10 9.7 9.7 0 0 1-.7 3.4l-1.6-1.6A8 8 0 1 0 6.1 5.6L4.6 4.1A9.8 9.8 0 0 1 12 4Z"/></svg>',
+  clock:'<svg viewBox="0 0 24 24"><path d="M12 2a10 10 0 1 0 10 10A10 10 0 0 0 12 2Zm0 18a8 8 0 1 1 8-8 8 8 0 0 1-8 8Zm1-13h-2v6l4.2 2.5 1-1.7-3.2-1.9Z"/></svg>'
+};
+
+let OV=null,CAMS=[],CUR=null,CURDATE='',SEGS=[],CURFILE='';
+const players={};
+let clkTimer=null;
+
+/* ───────── 实时监控 ───────── */
+function camCard(c){
+  const on=c.alive!==false;
+  return `<div class="cam" data-cam="${c.name}">
+    <div class="stage" id="st_${c.name}">
+      <div class="ph" id="ph_${c.name}">${on?'<div class="ring"></div><div>正在建立实时流…</div>':ICO.off+'<div>摄像头离线</div>'}</div>
+      <div class="ov">
+        <div class="ov-t">
+          <div><div class="nm">${c.label}</div><div class="zn">${c.zone}</div></div>
+          <div class="badge ${on?'load':'off'}" id="bd_${c.name}"><span class="dot"></span>${on?'连接中':'离线'}</div>
+        </div>
+        <div class="ov-b">
+          <span class="ip">${c.ip}</span>
+          <span class="clk hide" id="ck_${c.name}"></span>
+        </div>
+      </div>
+      <button class="rbtn" data-cam="${c.name}" title="回看这路录像">${ICO.play}回放</button>
+      <button class="mbtn hide" id="mb_${c.name}" data-cam="${c.name}" title="缩小">${ICO.min}</button>
+    </div>
+  </div>`;
+}
+
+function renderGrid(){
+  $('#grid').innerHTML=CAMS.map(camCard).join('');
+  $$('.cam').forEach(e=>e.onclick=()=>toggleBig(e.dataset.cam));
+  $$('.rbtn').forEach(b=>b.onclick=e=>{
+    e.stopPropagation(); selCam(b.dataset.cam); switchTab('play');
+  });
+  $$('.mbtn').forEach(b=>b.onclick=e=>{e.stopPropagation(); toggleBig(b.dataset.cam);});
+  // 只自动播第一组(4 路)。板子软编 4 路就占约 324% CPU(600% 上限),
+  // 10 路全开会压垮。其余显示占位卡片, 点谁播谁 —— 同样是"分组轮流",
+  // 但由用户主动选择, 比定时强转更自然(不会打断正在看的内容)。
+  CAMS.forEach(c=>{
+    if(c.alive===false) return;
+    if(groupOf(c.name)===0) startStream(c.name);
+    else showSlot(c.name);
+  });
+  $('#cLive').textContent=CAMS.filter(c=>c.alive!==false).length;
+}
+
+/* 分组: 10 路分 2 组, 与服务端 PREVIEW_GROUPS 保持一致 */
+const PREVIEW_GROUPS=2;
+function groupOf(name){
+  const i=CAMS.findIndex(c=>c.name===name);
+  return i<0?0:i%PREVIEW_GROUPS;
+}
+
+/* 未启动的摄像头显示占位卡片(不占用转码资源) */
+function showSlot(name){
+  const st=$('#st_'+name);
+  if(!st||st.dataset.slot) return;
+  st.dataset.slot='1';
+  const c=CAMS.find(x=>x.name===name);
+  const p=document.createElement('div');
+  p.className='ph slotph';
+  p.innerHTML=`<div class="sl-ico">${ICO.play}</div>
+    <div class="sl-t">第 ${groupOf(name)+1} 组</div>
+    <div class="sl-s">点击开始播放</div>`;
+  p.onclick=e=>{ e.stopPropagation(); startStream(name); };
+  st.appendChild(p);
+  const bd=$('#bd_'+name);
+  if(bd){ bd.className='badge'; bd.textContent='待播放'; }
+}
+
+/* 按摄像头实际分辨率设定画面容器比例。
+   相机子码流改成 16:9 (如 640x360 / 800x448) 后画面自动无黑边;
+   仍是非 16:9 也按真实比例显示, 不会拉伸变形。 */
+function setStageAR(st,w,h){
+  if(!st||!w||!h) return;
+  st.style.setProperty('--ar', w+'/'+h);
+}
+
+async function startStream(cam){
+  const st=$('#st_'+cam), ph=$('#ph_'+cam), bd=$('#bd_'+cam);
+  if(!st) return;
+  bd.className='badge load'; bd.innerHTML='<span class="dot"></span>连接中';
+  for(let i=0;i<26;i++){
+    try{
+      const r=await fetch('/live?cam='+cam,{cache:'no-store'});
+      if(r.status===200){ const t=await r.text(); if(t.includes('.ts')){ attach(cam); return; } }
+    }catch(e){}
+    await new Promise(r=>setTimeout(r,900));
+  }
+  if(ph){ ph.className='ph err'; ph.innerHTML=ICO.off+'<div>转码启动失败</div><div style="font-size:10.5px;opacity:.7">摄像头离线或并发已满</div>'; }
+  if(bd){ bd.className='badge off'; bd.innerHTML='<span class="dot"></span>失败'; }
+}
+
+function attach(cam){
+  const st=$('#st_'+cam);
+  let v=$('#v_'+cam);
+  if(!v){ v=document.createElement('video'); v.id='v_'+cam; v.playsInline=true; }
+  if(!st.contains(v)) st.prepend(v);
+  // muted 必须用 property 设置, 且每次 attach 都重设。
+  // Safari / 部分浏览器对 attribute 形式的 muted 支持不可靠,
+  // muted 失效会被自动播放策略拦截, 表现为画面卡住不动。
+  v.muted=true; v.defaultMuted=true; v.autoplay=true;
+  v.setAttribute('playsinline','');
+  const ph=$('#ph_'+cam); if(ph) ph.remove();
+  // 清掉"待播放"占位卡片(它是追加的, 不走 #ph_ 那套)
+  const sp=st.querySelector('.slotph'); if(sp) sp.remove();
+  delete st.dataset.slot;
+  const bd=$('#bd_'+cam);
+  if(bd){ bd.className='badge live'; bd.innerHTML='<span class="dot"></span>LIVE'; }
+  $('#ck_'+cam)?.classList.remove('hide');
+
+  if(players[cam]?.hls) players[cam].hls.destroy();
+  const url='/live?cam='+cam;
+  // 只在 Safari/iOS 这类"真原生支持"的浏览器走直接 src。
+  // Chrome/Edge 也会对 canPlayType 返回 "maybe", 但实际喂 HLS+TS 会报
+  // MEDIA_ERR_SRC_NOT_SUPPORTED(err:4), 所以必须排除 "maybe" 走 hls.js。
+  const nativeHls=/^probably$/.test(v.canPlayType('application/vnd.apple.mpegurl'))
+    && !/Chrome|Edg|Android/.test(navigator.userAgent);
+  if(nativeHls){
+    v.src=url;
+  }else if(window.Hls&&Hls.isSupported()){
+    const hls=new Hls({
+      // 不开 lowLatencyMode: 服务端是普通 HLS(非 LL-HLS, 无 PART 标签),
+      // 开低延迟模式反而会因反复重同步而黑屏
+      enableWorker:true,
+      lowLatencyMode:false,
+      liveSyncDurationCount:3,
+      liveMaxLatencyDurationCount:10,
+      maxBufferLength:30,
+      maxMaxBufferLength:60,
+      backBufferLength:30,
+      fragLoadingMaxRetry:6,
+      manifestLoadingMaxRetry:8,
+      appendLoadMaxRetry:6,
+      manifestLoadingTimeOut:12000,
+      fragLoadingTimeOut:25000
+    });
+    hls.loadSource(url); hls.attachMedia(v);
+    hls.on(Hls.Events.ERROR,(_,d)=>{
+      if(!d.fatal){ console.warn('[HLS 非致命]',d.type,d.details); return; }
+      console.error('[HLS 致命]',d.type,d.details);
+      if(d.type===Hls.ErrorTypes.NETWORK_ERROR){
+        // 切片被 ffmpeg 滚动删除是正常现象, 重试即可; 持续失败才恢复加载
+        if(hls.levels[0]&&hls.levels[0].details.live){ hls.startLoad(); }
+        else setTimeout(()=>{ try{hls.recoverMediaError();}catch(x){} },800);
+      }else if(d.type===Hls.ErrorTypes.MEDIA_ERROR){
+        try{ hls.recoverMediaError(); }catch(x){}
+      }else{
+        setTimeout(()=>{ try{ hls.recoverMediaError(); }catch(x){} },1200);
+      }
+    });
+    players[cam]={hls,video:v};
+  }else{
+    const p=document.createElement('div'); p.className='ph err'; p.style.zIndex=3;
+    p.innerHTML=ICO.off+'<div>此浏览器不支持 HLS 播放</div>'
+      +'<div style="font-size:10.5px;line-height:1.8;max-width:250px">'
+      +'请改用 Safari / Edge 打开<br>'
+      +(window.Hls?'若用 Chrome 请检查网络能否访问本机服务':'hls.js 未能加载，请检查板子服务是否正常')
+      +'</div>';
+    st.appendChild(p); return;
+  }
+  // 先点亮画面, 再尝试播放。
+  // 不能把 classList.add('on') 挂在 play() 的 then 里: 浏览器自动播放策略拦截时
+  // play() 返回的是 rejected Promise(不抛异常), then 永远不执行, 画面会一直 opacity:0。
+  v.classList.add('on');
+  v.play().catch(()=>{});
+  // 按摄像头实际分辨率设置画面比例。改相机子码流分辨率后无需改这里。
+  if(v.videoWidth&&v.videoHeight) setStageAR(st,v.videoWidth,v.videoHeight);
+  else v.addEventListener('loadedmetadata',
+    ()=>setStageAR(st,v.videoWidth,v.videoHeight),{once:true});
+  startClock(); updateMeters();
+
+  // 6秒后仍未真正开始播放 => 给出可读提示, 而不是让人对着黑屏猜
+  clearTimeout(v._diag);
+  v._diag=setTimeout(()=>{
+    if(v.currentTime>0) return;                 // 已经播起来了
+    const p=document.createElement('div');
+    p.className='ph err'; p.style.zIndex=3;
+    p.innerHTML=ICO.off+'<div>画面未开始播放</div>'
+      +'<div style="font-size:10.5px;line-height:1.8;max-width:240px">'
+      +'点击此处即可开始<br>若仍为黑屏, 请检查浏览器是否允许此站点自动播放</div>';
+    p.onclick=()=>{ p.remove(); v.play().catch(()=>{}); };
+    st.appendChild(p);
+  },6000);
+}
+
+function stopStream(cam){
+  const p=players[cam];
+  if(p){ if(p.hls)p.hls.destroy(); if(p.video){p.video.pause();p.video.removeAttribute('src');p.video.load();p.video.classList.remove('on');} }
+  delete players[cam];
+  fetch('/live/stop?cam='+cam+'&force=1').catch(()=>{});
+  const st=$('#st_'+cam);
+  if(st&&!st.querySelector('.ph')){
+    const d=document.createElement('div'); d.className='ph';
+    d.innerHTML=ICO.play+'<div>已停止</div><div style="font-size:10.5px;opacity:.65">点击画面重新开始</div>';
+    st.appendChild(d);
+  }
+  const bd=$('#bd_'+cam);
+  if(bd){ bd.className='badge idle'; bd.innerHTML='<span class="dot"></span>已停止'; }
+  $('#ck_'+cam)?.classList.add('hide');
+  updateMeters();
+}
+
+function toggleBig(cam){
+  const c=document.querySelector(`.cam[data-cam="${cam}"]`); if(!c) return;
+  const was=c.classList.contains('big');
+  resetGrid();
+  if(!was){
+    c.classList.add('big');
+    $('#mb_'+cam)?.classList.remove('hide');
+    setTimeout(()=>{ const v=$('#v_'+cam); if(v){v.style.opacity=1;} },20);
+  }
+}
+function resetGrid(){
+  $$('.cam').forEach(c=>c.classList.remove('big'));
+  $$('.mbtn').forEach(b=>b.classList.add('hide'));
+  $$('.stage video').forEach(v=>{ if(v.id) v.style.opacity=''; });
+}
+
+function startClock(){
+  if(clkTimer) return;
+  clkTimer=setInterval(()=>{
+    const d=new Date(), t=`${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+    $('#mClock').textContent=t;
+    Object.keys(players).forEach(c=>{ const e=$('#ck_'+c); if(e) e.textContent=t; });
+  },1000);
+}
+
+async function updateMeters(){
+  try{
+    const s=await (await fetch('/api/live')).json();
+    const box=$('#mStrBox'), v=$('#mStr');
+    v.textContent=s.active_streams+'/'+s.max_streams;
+    box.className='mt '+(s.active_streams>0?'ok':'');
+  }catch(e){}
+}
+
+function setDisk(d){
+  $('#mDisk').textContent=d.free_gb+'G 可用';
+  const b=$('#mDiskBox');
+  b.className='mt '+(d.used_pct>=90?'crit':d.used_pct>=75?'warn':'');
+}
+
+/* ══════════ 系统资源 ══════════ */
+const RICO={
+  cpu:'<path d="M3 13h4l2.5-7 4 14L16 13h5v2h-6.4l-1.6 4.6L6 6.8 4.6 15H3z"/>',
+  mem:'<path d="M4 6h16v12H4zm2 2v8h12V8zm2 2h8v4H8z"/>',
+  temp:'<path d="M12 2a2 2 0 0 1 2 2v9.3a5 5 0 1 1-4 0V4a2 2 0 0 1 2-2m0 3h-1v8.2l-.5.2a4 4 0 1 0 3 0l-.5-.2V5z"/>',
+  load:'<path d="M3 4h18v2H3zm0 5h12v2H3zm0 5h18v2H3zm0 5h12v2H3z"/>',
+  net:'<path d="M3 3h18v14H3zm2 2v10h14V5z"/>',
+  disk:'<path d="M3 5h18v6H3zm0 8h18v6H3zm2 2v2h4v-2zm6 0v2h6v-2z"/>',
+  stream:'<path d="M4 4h16v12H4zm2 2v8h12V6zM8 18h8v2H8z"/>'
+};
+const fmtUp=s=>{const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),
+  m=Math.floor(s%3600/60); return d?`${d}天${h}时`:(h?`${h}时${m}分`:`${m}分`);};
+const fmtRate=k=>k>=1000?(k/1000).toFixed(1)+' Mbps':Math.round(k)+' Kbps';
+const fmtDur=d=>d?(d>=60?Math.floor(d/60)+'分'+Math.round(d%60)+'秒':Math.round(d)+'秒'):'';
+const pctCls=(v,w,c)=>v>=c?'crit':v>=w?'warn':'';
+
+function row(k,ico,v,x,pct,bar){
+  return `<div class="res-row">
+    <div class="r-top">
+      <span class="r-k"><svg viewBox="0 0 24 24">${RICO[ico]}</svg>${k}</span>
+      <span class="r-v ${pct!=null?pctCls(pct,bar.w,bar.c):''}">${v}${
+        x?`<span class="r-x">${x}</span>`:''}</span>
+    </div>
+    ${pct!=null?`<div class="rbar"><i class="${bar.k||''}" style="width:${
+      Math.max(0,Math.min(100,pct))}%"></i></div>`:''}
+  </div>`;
+}
+
+function renderSys(s){
+  if(!s||!s.mem) return;
+  const cpu=s.cpu_pct==null?0:s.cpu_pct;
+  const t=s.temp?s.temp.c:null;
+  const mp=s.mem.used_pct;
+  $('#rCpu').textContent=(s.cpu_pct==null?'--':cpu.toFixed(0))+'%';
+  $('#rCpu').className=pctCls(cpu,70,88);
+  $('#rTemp').textContent=(t==null?'--':t.toFixed(0))+'°';
+  $('#rTemp').className=pctCls(t||0,72,85);
+  $('#rMem').textContent=mp.toFixed(0)+'%';
+  $('#rMem').className=pctCls(mp,75,90);
+
+  const ncpu=s.ncpu||6;
+  $('#resRows').innerHTML=
+    row('CPU 占用','cpu',
+      s.cpu_pct==null?'采样中…':s.cpu_pct.toFixed(1)+'%',
+      `${ncpu} 核`,
+      s.cpu_pct,{w:70,c:88,k:cpu>88?'crit':cpu>70?'warn':'grad'}) +
+    row('系统负载','load',s.load1.toFixed(2),
+      `每核 ${s.load_per_core} · 5 分钟 ${s.load5}`,
+      Math.min(100,s.load_per_core*66),
+      {w:66,c:100,k:s.load_per_core>1.5?'crit':s.load_per_core>1?'warn':'ok'}) +
+    row('内存','mem',`${s.mem.used_gb} / ${s.mem.total_gb} G`,
+      `可用 ${s.mem.avail_gb} G`, s.mem.used_pct,
+      {w:75,c:90,k:s.mem.used_pct>90?'crit':s.mem.used_pct>75?'warn':'ok'}) +
+    row('CPU 温度','temp',t==null?'--':t.toFixed(1)+' °C',
+      t==null?'':(t>85?'偏高':t>72?'偏暖':'正常'), t==null?0:Math.min(100,t),
+      {w:72,c:85,k:t>85?'crit':t>72?'warn':'ok'}) +
+    row('网络吞吐','net','↓ '+fmtRate(s.net.rx_kbps),
+      '↑ '+fmtRate(s.net.tx_kbps), null) +
+    row('录像盘','disk',`${s.disk.free_gb} G 可用`,
+      `共 ${s.disk.total_gb} G · 已用 ${s.disk.used_pct}%`, s.disk.used_pct,
+      {w:75,c:90,k:s.disk.used_pct>90?'crit':s.disk.used_pct>75?'warn':'ok'}) +
+    row('实时转码','stream',`${s.streams} / ${s.max_streams} 路`,
+      s.streams?'正在转码':'空闲', s.streams/s.max_streams*100,
+      {w:99,c:100,k:s.streams?'ok':''});
+
+  $('#resNote').innerHTML=
+    `已连续运行 <b>${fmtUp(s.uptime_s)}</b> · 每 3 秒刷新<br>`
+    +(s.streams
+      ? `<span class="${s.streams>=s.max_streams?'hot':''}">已用满 ${s.max_streams} 路并发上限（板子 CPU 限制），看够即自动释放</span>`
+      : '实时画面按需转码，关闭页面后 60 秒自动释放 CPU');
+}
+
+async function pollSys(){
+  try{ renderSys(await (await fetch('/api/sysinfo',{cache:'no-store'})).json()); }
+  catch(e){}
+}
+$('#resToggle').onclick=e=>{
+  e.stopPropagation();
+  const box=$('#resBox');
+  box.classList.toggle('open');
+  if(box.classList.contains('open')) pollSys();
+};
+document.addEventListener('click',()=>$('#resBox').classList.remove('open'));
+
+async function loadLive(){
+  try{
+    const p=await (await fetch('/api/ping')).json();
+    const map={}; p.cameras.forEach(c=>map[c.name]=c.alive);
+    OV=await (await fetch('/api/overview')).json();
+    CAMS=OV.cameras.map(c=>({...c,alive:map[c.name]}));
+    setDisk(OV.disk);
+    renderGrid(); updateMeters(); startClock();
+  }catch(e){
+    $('#grid').innerHTML=`<div class="panel" style="grid-column:1/-1"><div class="empty">
+      <div class="t">无法连接板子服务</div><div class="s">请确认 http://192.168.1.20:80 可访问</div></div></div>`;
+  }
+}
+
+/* ───────── 录像回放 ───────── */
+function renderPicks(){
+  if(!OV) return;
+  $('#picks').innerHTML=OV.cameras.map(c=>{
+    const n=c.total_segments;
+    return `<button class="pick${CUR===c.name?' on':''}" data-cam="${c.name}">
+      <span class="pk">${c.label.replace(/\D/g,'')}</span>
+      <span class="pt">
+        <span class="pn">${c.label}</span>
+        <span class="pz">${c.zone}</span>
+      </span>
+      <span class="pc ${n?'has':'none'}">${n?n+' 片':'无'}</span>
+    </button>`;
+  }).join('');
+  $$('#picks .pick').forEach(b=>b.onclick=()=>selCam(b.dataset.cam));
+}
+
+async function selCam(name){
+  CUR=name; CURFILE='';
+  if(!OV) OV=await (await fetch('/api/overview')).json();
+  renderPicks();
+  const c=OV.cameras.find(x=>x.name===name);
+  // 无录像时也别让日期框空着, 否则整个页面看着像坏了
+  const today=new Date().toISOString().slice(0,10).replace(/-/g,'');
+  const ds=c.dates.length?c.dates:[today];
+  $('#pTitle').textContent=c.label+' · '+c.zone;
+  $('#dSel').innerHTML=ds.map(d=>`<option value="${d}">${dstr(d)}</option>`).join('');
+  $('#dSel').onchange=()=>loadSeg(CUR,$('#dSel').value);
+  $('#pEmpty').classList.add('hide');
+  $('#pv').classList.add('hide');
+  await loadSeg(name,ds[0]);
+}
+
+function renderStats(cam,segs){
+  const day=segs.filter(s=>s.date===(CURDATE||''));
+  const mb=day.reduce((a,s)=>a+s.size_mb,0);
+  const mins=day.length*10;
+  const hrs=mins/60;
+  const left=OV.disk.free_gb;
+  const cards=[
+    {k:'当日片段',v:day.length,u:'段',c:'a'},
+    {k:'覆盖时长',v:hrs>=24?(hrs/24).toFixed(1):hrs.toFixed(1),u:hrs>=24?'天':'小时',c:'g'},
+    {k:'当日体积',v:mb>=1024?(mb/1024).toFixed(2):mb.toFixed(0),u:mb>=1024?'GB':'MB',c:''},
+    {k:'盘剩余',v:left,u:'G',c:left<20?'':'g'}
+  ];
+  $('#pStats').innerHTML=cards.map(x=>`<div class="st ${x.c}">
+    <div class="k">${x.k}</div><div class="v">${x.v}<span class="u">${x.u}</span></div></div>`).join('');
+}
+
+async function loadSeg(cam,date){
+  const r=await (await fetch(`/api/segments?cam=${cam}&date=${date}&probe=1`)).json();
+  SEGS=r.segments; CURDATE=date;
+  const all=r.segments.length;
+  $('#pHint').textContent=date?`${dstr(date)} · 共 ${all} 个 10 分钟片段`:`共 ${all} 个片段`;
+  renderStats(cam,SEGS);
+  // 分片文件名里的 time 是 6 位 HHMMSS（如 210618）。
+  // ffmpeg 的 segment 切点落在关键帧上，不保证是 10 分钟整点
+  // （实测出现 21:06、21:16），所以按「该片段属于哪个 10 分钟段」归一化，
+  // 再与格子的 HHMM 对应，否则会一个都匹配不上。
+  const slotOf=t=>{ const hh=+t.slice(0,2), mm=+t.slice(2,4);
+    return pad(hh)+pad(Math.floor(mm/10)*10); };
+  const map={}; SEGS.forEach(s=>{ const k=slotOf(s.time); map[k]=map[k]||s; });
+
+  // 只渲染"有内容"的时段，144 格全铺会让录像淹没在空白里。
+  // 跨零点的录像段（如 23:5x 属于次日 00:0x）用小时段整体归组，避免漏掉。
+  const hrs=[...new Set(SEGS.map(s=>s.time.slice(0,2)))].sort();
+  let h='';
+  for(const HH of hrs){
+    const slots=[];
+    for(let m=0;m<60;m+=10){
+      const k=HH+pad(m), s=map[k];
+      if(!s) continue;
+      const cls=s.live?' slot live':' slot has';
+      const tip=s.live?`${hhmm(k)} 段 · 正在录制，约 1 分钟后可回看`
+        :`${hhmm(k)} 段 · 实际起 ${hhmm(s.time)} · ${s.size_mb} MB`;
+      slots.push(`<div class="${cls.trim()}" data-t="${s.time}" title="${tip}">${hhmm(k)}</div>`);
+    }
+    if(!slots.length) continue;
+    const gb=SEGS.filter(s=>s.time.slice(0,2)===HH)
+      .reduce((a,s)=>a+s.size_mb,0);
+    h+=`<div class="tl-h">${HH}:00 <span style="text-transform:none;letter-spacing:0;font-weight:500;color:var(--tx-3)">${slots.length} 段 · ${gb>=1024?(gb/1024).toFixed(2)+' GB':gb.toFixed(0)+' MB'}</span></div>`;
+    h+=`<div style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:4px">${slots.join('')}</div>`;
+  }
+  if(!h) h=`<div class="empty" style="grid-column:1/-1;padding:28px">
+    <div class="t">${dstr(date)} 没有录像</div>
+    <div class="s">这路摄像头当天没有录到片段，换个日期或选其它摄像头</div></div>`;
+  $('#tl').innerHTML=h;
+  $$('#tl .slot.has').forEach(e=>e.onclick=()=>play(cam,date,e.dataset.t));
+  renderTable();
+}
+
+function renderTable(){
+  const w=$('#listWrap');
+  if(!SEGS.length){ w.classList.add('hide'); return; }
+  w.classList.remove('hide');
+  $('#tb').innerHTML=SEGS.slice().reverse().map(s=>{
+    const tg=s.live?'<span class="tg l">录制中</span>':'<span class="tg r">'+dstr(s.date)+'</span>';
+    const act=s.live?'<span style="color:var(--tx-3);font-size:11px">—</span>'
+      :`<a class="dl" href="/download?cam=${CUR}&file=${CUR}_${s.date}_${s.time}.mp4">${ICO.dl}下载</a>`;
+    return `<tr data-t="${s.time}" class="${s.time===CURFILE?'on':''}">
+      <td>${tg} <b style="color:var(--tx);margin-left:4px">${hhmm(s.time)}</b></td>
+      <td data-d>—</td><td data-r>—</td><td data-c>—</td>
+      <td class="num">${s.size_mb} MB</td><td>${act}</td></tr>`;
+  }).join('');
+  // 有 probe 数据的直接填上(缓存命中或服务端已返回);
+  // 没有的先留"—", 用户点开该段时再查详情回填
+  const _fmt=d=>fmtDur(d)||'—';
+  $$('#tb tr').forEach(tr=>{
+    const s=SEGS.find(x=>x.time===tr.dataset.t);
+    if(!s) return;
+    const p=s.probe||PROBE_CACHE[s.file];
+    if(!p) return;
+    tr.children[1].textContent=_fmt(p.duration);
+    tr.children[2].textContent=p.width?p.width+'×'+p.height:'—';
+    tr.children[3].textContent=(p.codec||'').toUpperCase()||'—';
+  });
+  $$('#tb tr').forEach(tr=>tr.onclick=e=>{
+    if(e.target.closest('a')) return;
+    if(tr.querySelector('.tg.l')) return;
+    play(CUR,CURDATE,tr.dataset.t);
+  });
+}
+
+const PROBE_CACHE={};
+async function fillRows(){
+  for(const s of SEGS){
+    if(s.live||s.probe||PROBE_CACHE[s.file]) continue;
+    const key=s.file;
+    // 已查过就复用, 避免同一段反复请求
+    if(!PROBE_CACHE[key]){
+      try{
+        const r=await fetch(`/api/probe?cam=${CUR}&file=${encodeURIComponent(key)}`,{cache:'no-store'});
+        if(r.ok) PROBE_CACHE[key]=await r.json();
+      }catch(e){}
+    }
+    if(PROBE_CACHE[key]) s.probe=PROBE_CACHE[key];
+  }
+  renderTable();
+}
+
+async function play(cam,date,time){
+  const file=`${cam}_${date}_${time}.mp4`;
+  CURFILE=time;
+  const s=SEGS.find(x=>x.time===time);
+  if(s&&s.live){
+    $('#pv').classList.add('hide');
+    $('#plD').classList.add('hide');
+    $('#plT').textContent=`${dstr(date)} ${hhmm(time)} · 正在录制`;
+    $('#plM').textContent='该片段尚未录制完成，通常 1 分钟内闭合后即可回看';
+    return;
+  }
+  const a=$('#plD');
+  a.classList.remove('hide');
+  a.href='/download?cam='+cam+'&file='+encodeURIComponent(file);
+  $('#pv').classList.remove('hide');
+  const rv=$('#rv');
+  rv.src='/video?cam='+cam+'&file='+encodeURIComponent(file);
+  rv.play().catch(()=>{});
+  $('#plT').textContent=`${dstr(date)} ${hhmm(s.time)} 起 · 10 分钟片段`;
+  $$('#tl .slot').forEach(e=>e.classList.toggle('cur',e.dataset.t===time));
+  renderTable();
+  if(s){
+    const p=await (await fetch(`/api/probe?cam=${cam}&file=${encodeURIComponent(file)}`)).json();
+    PROBE_CACHE[file]=p;          // 缓存, 切走再切回不必重查
+    const tr=document.querySelector(`#tb tr[data-t="${time}"]`);
+    const fmt=fmtDur;
+    if(tr){
+      tr.children[1].textContent=fmt(p.duration);
+      tr.children[2].textContent=p.width?p.width+'×'+p.height:'—';
+      tr.children[3].textContent=(p.codec||'').toUpperCase()||'—';
+    }
+    $('#plM').innerHTML=p.width&&p.height
+      ?`${p.width}×${p.height} · <b style="color:var(--tx-2)">${(p.codec||'').toUpperCase()}</b> · ${fmtDur(p.duration)} · ${s.size_mb} MB · 原始比例 ${(p.width/p.height).toFixed(3)}:1（播放保持不变形）`
+      :`${s.size_mb} MB · <span style="color:var(--warn)">该片段仍在写入，暂读不到详细信息</span>`;
+  }
+}
+
+function stopAll(){ Object.keys(players).forEach(stopStream); }
+
+function switchTab(t){
+  $$('.tab').forEach(e=>e.classList.toggle('on',e.dataset.t===t));
+  $('#vLive').classList.toggle('hide',t!=='live');
+  $('#vPlay').classList.toggle('hide',t!=='play');
+  if(t==='live'){ loadLive(); startClock(); return; }
+  // 进回放页: 停掉实时转码, 列出摄像头并默认选中有录像的第一路
+  stopAll();
+  if(OV) renderPicks();
+  if(!CUR){
+    const first=OV&&(OV.cameras.find(c=>c.total_segments>0)||OV.cameras[0]);
+    if(first) selCam(first.name);
+  }
+}
+
+$$('.tab').forEach(e=>e.onclick=()=>switchTab(e.dataset.t));
+$$('.gbtn[data-g]').forEach(b=>b.onclick=()=>{
+  $$('.gbtn[data-g]').forEach(x=>x.classList.remove('on')); b.classList.add('on');
+  resetGrid();
+  const g=$('#grid'); g.className='grid '+(b.dataset.g==='g3'?'':b.dataset.g);
+});
+$('#bStop').onclick=stopAll;
+
+loadLive();
+pollSys();
+setInterval(pollSys,3000);
+setInterval(async()=>{ try{
+  const s=await (await fetch('/api/status')).json();
+  setDisk(s.disk);
+  Object.entries(s.cameras).forEach(([k,v])=>{
+    if(players[k]) return;
+    const b=$('#bd_'+k); if(!b) return;
+    if(v==='offline'){ b.className='badge off'; b.innerHTML='<span class="dot"></span>离线'; }
+    else if(!b.classList.contains('idle')&&!b.classList.contains('load')){
+      b.className='badge live'; b.innerHTML='<span class="dot"></span>REC';
+    }
+  });
+  updateMeters();
+}catch(e){} },12000);
+</script>
+</body>
+</html>

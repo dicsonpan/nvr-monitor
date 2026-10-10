@@ -1,0 +1,19 @@
+[Unit]
+Description=NVR 录像系统
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/nvr/bin/nvr-recorder.sh start
+ExecStop=/opt/nvr/bin/nvr-recorder.sh stop
+Restart=always
+RestartSec=10
+# 关键: start 脚本会 fork 子进程后立即返回, 这里用 oneshot + 保持运行更合适
+Type=oneshot
+RemainAfterExit=yes
+TimeoutStartSec=60
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
