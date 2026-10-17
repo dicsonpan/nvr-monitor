@@ -16,3 +16,9 @@ __pycache__/
 *.swp
 .idea/
 .vscode/
+
+# 本地真实配置(含板子 IP/密码, 勿入库)
+deploy.local.conf
+
+# WorkBuddy 项目记忆(本地)
+.workbuddy/

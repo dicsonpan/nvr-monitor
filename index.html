@@ -254,6 +254,7 @@ body{
 .badge.live{color:var(--live);border-color:rgba(34,197,94,.4)}
 .badge.live .dot{animation:blink 1.5s ease-in-out infinite}
 .badge.load{color:var(--warn);border-color:rgba(245,158,11,.4)}
+.badge.hw{color:#93c5fd;border-color:rgba(59,130,246,.45)}
 .badge.off{color:var(--err);border-color:rgba(239,68,68,.4)}
 .badge.idle{color:var(--tx-3)}
 @keyframes blink{0%,100%{opacity:1;box-shadow:0 0 0 0 currentColor}50%{opacity:.35}}
@@ -466,7 +467,7 @@ a.dl svg{width:11px;height:11px;fill:currentColor}
     <div class="meters">
       <div class="mt"><div class="k">系统时间</div><div class="v" id="mClock">--:--:--</div></div>
       <div class="mt" id="mDiskBox"><div class="k">录像盘</div><div class="v" id="mDisk">--</div></div>
-      <div class="mt" id="mStrBox"><div class="k">实时转码</div><div class="v" id="mStr">0/4</div></div>
+      <div class="mt" id="mStrBox"><div class="k">实时预览</div><div class="v" id="mStr">0 路</div></div>
 
       <!-- 系统资源: 默认收起成一条状态条, 点击展开完整指标 -->
       <div class="mt res" id="resBox">
@@ -506,10 +507,7 @@ a.dl svg{width:11px;height:11px;fill:currentColor}
       <div class="grp">
         <button class="gbtn danger" id="bStop"><svg viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>全部停止</button>
       </div>
-      <div class="note">
-        点击画面放大 · 同时最多 <b style="color:var(--tx-2)">4 路</b>转码（板子 CPU 限制，看完自动释放）<br>
-        子码流 <b style="color:var(--tx-2)">800×448 (16:9)</b>，按实际分辨率显示，不裁切不变形
-      </div>
+      <div class="note" id="liveNote">正在检测各路子码流编码…</div>
     </div>
     <div class="grid" id="grid"></div>
   </section>
@@ -593,6 +591,10 @@ const ICO={
 
 let OV=null,CAMS=[],CUR=null,CURDATE='',SEGS=[],CURFILE='';
 const players={};
+const userStopped=new Set();   // 用户主动停掉的路(全部停止/单路停止), 不自动重启
+const pendingRetry=new Set();  // 启动失败或名额已满, 等待自动补播的路
+const connecting=new Set();    // 正在建立连接的路
+let liveState=null;
 let clkTimer=null;
 
 /* ───────── 实时监控 ───────── */
@@ -624,39 +626,35 @@ function renderGrid(){
     e.stopPropagation(); selCam(b.dataset.cam); switchTab('play');
   });
   $$('.mbtn').forEach(b=>b.onclick=e=>{e.stopPropagation(); toggleBig(b.dataset.cam);});
-  // 只自动播第一组(4 路)。板子软编 4 路就占约 324% CPU(600% 上限),
-  // 10 路全开会压垮。其余显示占位卡片, 点谁播谁 —— 同样是"分组轮流",
-  // 但由用户主动选择, 比定时强转更自然(不会打断正在看的内容)。
+  // 全部在线摄像头都自动开始播放(2026-10-17 起取消分组轮播):
+  //   H.264 子码流 -> 服务端零转码直通, 单路 CPU 约 3%, 10 路全开无压力
+  //   HEVC 子码流 -> 软编, 受并发上限; 满了自动排队, 停下任意一路立即补上
+  userStopped.clear(); pendingRetry.clear();
   CAMS.forEach(c=>{
     if(c.alive===false) return;
-    if(groupOf(c.name)===0) startStream(c.name);
-    else showSlot(c.name);
+    startStream(c.name);
   });
   $('#cLive').textContent=CAMS.filter(c=>c.alive!==false).length;
 }
 
-/* 分组: 10 路分 2 组, 与服务端 PREVIEW_GROUPS 保持一致 */
-const PREVIEW_GROUPS=2;
-function groupOf(name){
-  const i=CAMS.findIndex(c=>c.name===name);
-  return i<0?0:i%PREVIEW_GROUPS;
-}
+/* 模式徽章: 直通=绿(零CPU), 硬编=蓝(VPU), 软编=橙(吃CPU) */
+const MODE_BADGE={copy:['live','LIVE · 直通'],hw:['hw','LIVE · 硬编'],sw:['load','LIVE · 软编']};
 
-/* 未启动的摄像头显示占位卡片(不占用转码资源) */
-function showSlot(name){
+/* 未播放的摄像头显示占位卡片(启动失败或并发已满, 可点击重试) */
+function showSlot(name,reason){
   const st=$('#st_'+name);
   if(!st||st.dataset.slot) return;
   st.dataset.slot='1';
-  const c=CAMS.find(x=>x.name===name);
   const p=document.createElement('div');
   p.className='ph slotph';
   p.innerHTML=`<div class="sl-ico">${ICO.play}</div>
-    <div class="sl-t">第 ${groupOf(name)+1} 组</div>
-    <div class="sl-s">点击开始播放</div>`;
-  p.onclick=e=>{ e.stopPropagation(); startStream(name); };
+    <div class="sl-t">${reason||'等待播放名额'}</div>
+    <div class="sl-s">点击重试</div>`;
+  p.onclick=e=>{ e.stopPropagation(); userStopped.delete(name); startStream(name); };
   st.appendChild(p);
   const bd=$('#bd_'+name);
-  if(bd){ bd.className='badge'; bd.textContent='待播放'; }
+  if(bd){ bd.className='badge load'; bd.innerHTML='<span class="dot"></span>等待中'; }
+  pendingRetry.add(name);
 }
 
 /* 按摄像头实际分辨率设定画面容器比例。
@@ -670,16 +668,20 @@ function setStageAR(st,w,h){
 async function startStream(cam){
   const st=$('#st_'+cam), ph=$('#ph_'+cam), bd=$('#bd_'+cam);
   if(!st) return;
+  userStopped.delete(cam); pendingRetry.delete(cam); connecting.add(cam);
   bd.className='badge load'; bd.innerHTML='<span class="dot"></span>连接中';
   for(let i=0;i<26;i++){
+    if(userStopped.has(cam)){ connecting.delete(cam); return; }   // 期间被全部停止
     try{
       const r=await fetch('/live?cam='+cam,{cache:'no-store'});
-      if(r.status===200){ const t=await r.text(); if(t.includes('.ts')){ attach(cam); return; } }
+      if(r.status===429){ connecting.delete(cam); showSlot(cam,'转码名额已满'); return; }
+      if(r.status===200){ const t=await r.text(); if(t.includes('.ts')){ connecting.delete(cam); attach(cam); return; } }
     }catch(e){}
     await new Promise(r=>setTimeout(r,900));
   }
-  if(ph){ ph.className='ph err'; ph.innerHTML=ICO.off+'<div>转码启动失败</div><div style="font-size:10.5px;opacity:.7">摄像头离线或并发已满</div>'; }
-  if(bd){ bd.className='badge off'; bd.innerHTML='<span class="dot"></span>失败'; }
+  connecting.delete(cam);
+  if(ph){ ph.remove(); }
+  showSlot(cam,'连接失败');
 }
 
 function attach(cam){
@@ -783,9 +785,11 @@ function stopStream(cam){
   const st=$('#st_'+cam);
   if(st&&!st.querySelector('.ph')){
     const d=document.createElement('div'); d.className='ph';
-    d.innerHTML=ICO.play+'<div>已停止</div><div style="font-size:10.5px;opacity:.65">点击画面重新开始</div>';
+    d.innerHTML=ICO.play+'<div>已停止</div><div style="font-size:10.5px;opacity:.65">点击重新开始</div>';
+    d.onclick=e=>{ e.stopPropagation(); startStream(cam); };
     st.appendChild(d);
   }
+  userStopped.add(cam);
   const bd=$('#bd_'+cam);
   if(bd){ bd.className='badge idle'; bd.innerHTML='<span class="dot"></span>已停止'; }
   $('#ck_'+cam)?.classList.add('hide');
@@ -817,14 +821,66 @@ function startClock(){
   },1000);
 }
 
-async function updateMeters(){
+async function updateMeters(state){
   try{
-    const s=await (await fetch('/api/live')).json();
-    const box=$('#mStrBox'), v=$('#mStr');
-    v.textContent=s.active_streams+'/'+s.max_streams;
-    box.className='mt '+(s.active_streams>0?'ok':'');
+    const s=state||await (await fetch('/api/live',{cache:'no-store'})).json();
+    liveState=s;
+    const m=s.stream_modes||{};
+    const parts=[];
+    if(m.copy)parts.push('直通'+m.copy);
+    if(m.hw)parts.push('硬编'+m.hw);
+    if(m.sw)parts.push('软编'+m.sw);
+    $('#mStr').textContent=parts.length?parts.join(' + '):'0 路';
+    $('#mStrBox').className='mt '+(s.active_streams>0?'ok':'');
+    // 工具栏动态说明: 让人一眼看出每路花不花 CPU
+    let note;
+    if(!s.active_streams) note='实时画面按需启动，关闭页面后自动释放 CPU';
+    else{
+      note=`<b style="color:var(--tx-2)">${s.active_streams} 路</b>实时中`;
+      if(m.copy)note+=` · ${m.copy} 路零转码直通`;
+      if(m.hw)note+=` · ${m.hw} 路 VPU 硬编`;
+      if(m.sw)note+=` · ${m.sw} 路软编`;
+      if(m.sw>=s.max_streams)note+=' · 软编已满，停下任意一路自动补上';
+    }
+    $('#liveNote').innerHTML=note
+      +'<br>子码流 <b style="color:var(--tx-2)">800×448 (16:9)</b>，按实际分辨率显示，不裁切不变形';
   }catch(e){}
 }
+
+/* 每 5 秒核对服务端状态: 补模式徽章 + 名额释放后自动补上等待的路 */
+async function pollLiveState(){
+  try{
+    const s=await (await fetch('/api/live',{cache:'no-store'})).json();
+    updateMeters(s);
+    const m=s.stream_modes||{};
+    for(const c of s.cameras){
+      const nm=c.name, st=$('#st_'+nm), bd=$('#bd_'+nm);
+      if(!st) continue;
+      if(players[nm]){
+        // 已在播放: 补一次模式徽章(attach 时只写了 LIVE)
+        const mb=MODE_BADGE[c.mode];
+        if(mb&&bd&&bd.textContent.indexOf('·')<0){
+          bd.className='badge '+mb[0];
+          bd.innerHTML='<span class="dot"></span>'+mb[1];
+        }
+        continue;
+      }
+      if(userStopped.has(nm)||connecting.has(nm)) continue;
+      // 未播放: 名额够就自动开始/补上, 不够就更新占位文案
+      const mode=c.mode||'sw';
+      const cap=mode==='copy'?s.max_total:(mode==='hw'?s.max_hw_streams:s.max_streams);
+      const cnt=mode==='copy'?s.active_streams:(m[mode]||0);
+      if(s.active_streams<s.max_total&&cnt<cap){
+        startStream(nm);
+      }else{
+        const sl=st.querySelector('.slotph .sl-t');
+        if(sl)sl.textContent='转码名额已满，等待中';
+        else if(!st.querySelector('.ph')) showSlot(nm,'转码名额已满，等待中');
+      }
+    }
+  }catch(e){}
+}
+setInterval(pollLiveState,5000);
 
 function setDisk(d){
   $('#mDisk').textContent=d.free_gb+'G 可用';
@@ -865,6 +921,7 @@ function renderSys(s){
   const cpu=s.cpu_pct==null?0:s.cpu_pct;
   const t=s.temp?s.temp.c:null;
   const mp=s.mem.used_pct;
+  const sm=s.stream_modes||{};
   $('#rCpu').textContent=(s.cpu_pct==null?'--':cpu.toFixed(0))+'%';
   $('#rCpu').className=pctCls(cpu,70,88);
   $('#rTemp').textContent=(t==null?'--':t.toFixed(0))+'°';
@@ -893,15 +950,18 @@ function renderSys(s){
     row('录像盘','disk',`${s.disk.free_gb} G 可用`,
       `共 ${s.disk.total_gb} G · 已用 ${s.disk.used_pct}%`, s.disk.used_pct,
       {w:75,c:90,k:s.disk.used_pct>90?'crit':s.disk.used_pct>75?'warn':'ok'}) +
-    row('实时转码','stream',`${s.streams} / ${s.max_streams} 路`,
-      s.streams?'正在转码':'空闲', s.streams/s.max_streams*100,
+    row('实时转码','stream',`${s.streams} 路在放`,
+      sm.copy?`${sm.copy} 直通 · ${sm.hw||0} 硬编 · ${sm.sw||0} 软编`:'按需启动',
+      s.streams?Math.min(100,s.streams/(s.max_total||12)*100):0,
       {w:99,c:100,k:s.streams?'ok':''});
 
   $('#resNote').innerHTML=
     `已连续运行 <b>${fmtUp(s.uptime_s)}</b> · 每 3 秒刷新<br>`
     +(s.streams
-      ? `<span class="${s.streams>=s.max_streams?'hot':''}">已用满 ${s.max_streams} 路并发上限（板子 CPU 限制），看够即自动释放</span>`
-      : '实时画面按需转码，关闭页面后 60 秒自动释放 CPU');
+      ? (sm.copy?`<b>${sm.copy} 路零转码直通</b>（CPU 占用极低）<br>`:'')
+        +(sm.sw?`<span class="${sm.sw>=s.max_streams?'hot':''}">${sm.sw} 路软编转码中（上限 ${s.max_streams} 路）</span>`:'')
+        +(sm.hw?`${sm.hw} 路 VPU 硬编`:'')
+      : '实时画面按需启动，关闭页面后自动释放 CPU');
 }
 
 async function pollSys(){
@@ -1107,7 +1167,11 @@ async function play(cam,date,time){
   }
 }
 
-function stopAll(){ Object.keys(players).forEach(stopStream); }
+function stopAll(){
+  Object.keys(players).forEach(stopStream);
+  CAMS.forEach(c=>userStopped.add(c.name));   // 连接中的也标记, 阻止自动补播
+  updateMeters();
+}
 
 function switchTab(t){
   $$('.tab').forEach(e=>e.classList.toggle('on',e.dataset.t===t));

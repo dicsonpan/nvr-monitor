@@ -1,27 +1,36 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-NVR 监控服务 (示例配置)
+NVR 监控服务
 - 录像查询: 扫描 /mnt/nvr/recordings 下的 10 分钟分片, 时间轴检索 / 在线播放 / 下载
-- 实时预览: RTSP 子码流 -> HLS 切片, 浏览器多路九宫格
+- 实时预览: 自适应三段式管道 —— 零转码直通 / VPU 硬编 / 软编, 不再分组轮播
 
-实时预览为什么这么设计
-----------------------
-浏览器不能直接播 RTSP。HLS 相比 WebRTC/MSE 的优势是纯 HTTP、穿透性好、
-抗网络抖动(切片后抖动不会让整段卡死), 延迟 1-2 秒对安防足够。
+实时预览为什么这么设计(2026-10-17 重构)
+--------------------------------------
+旧设计: 所有子码流一律 libx264 软编成 HLS。RK3399 软编单路约 81% CPU,
+并发锁 4 路, 再叠加"分 2 组轮播"——结果奇数路自动播、偶数路只能手点,
+点满 4 路还被上限挡住, 体验怪异且 10 路永远看不全。
 
-按需转码 + 限流的原因
----------------------
-RK3399 的 VPU 硬编不可用: /dev/video2 是 Multiplanar 类型,
-ffmpeg 4.2.7(focal 最新版) 的 h264_v4l2m2m 对它支持不全, 实测直接挂死。
-故只能用软编, 实测单路 704x576 约需 128% CPU, 4 路约 565%(6 核已近上限)。
-因此: 只转"当前正在看"的摄像头, 全局并发上限 MAX_STREAMS, 空闲 60 秒自动停。
-录像本身是零编码, 不受此影响。
+新设计先回答一个问题: 真的每一路都需要"转码"吗?
+  1. 子码流本来就是 H.264(逐台 ffprobe 探测, 结果缓存 6 小时):
+     → 零转码直通。ffmpeg -c:v copy 把 RTSP 直接 remux 成 HLS/TS,
+       单路 CPU 约 2-5%, 10 路全开也毫无压力。金利来 10 路里 6 路
+       (.21-.24/.29/.30)子码流就是 H.264, 改完相机设置后全部走这条。
+  2. 子码流是 HEVC(浏览器普遍不解):
+     → 优先走板子 VPU 硬编(hevc_v4l2m2m 解码 + h264_v4l2m2m 编码)。
+       需要较新 ffmpeg(>=5.1, 4.2.7 对 RK3399 的 multiplanar 编码节点
+       支持不全会直接失败)。启动时自动探测 + 实测一条, 不可用就自动放弃。
+  3. 以上都不可用:
+     → 退回 libx264 软编(即旧参数), 并发 4 路。
+任一路启动后进程死掉且从未产出切片, 记失败并失效该路探测缓存
+(可能相机端改过编码), 不会黑屏卡死; 硬编全局失败则整体回退软编。
 
-画面比例
---------
-子码流 704x576 = 1.222:1 (既不是 4:3 也不是 16:9)。缩放保持原始比例,
-前端 object-fit: contain + 黑边留白, 不裁切不变形。
+并发额度按模式分别计算: 直通不占软编额度(只受 MAX_TOTAL 兜底),
+硬编 8 路, 软编 4 路。分组轮播整体删除——直通模式下 10 路常开
+也没有 CPU 压力, 打开页面即全部实时。
+
+路径均可用环境变量覆盖(NVR_BASE / NVR_CAMERAS_JSON / NVR_MAX_SW ...),
+便于本地测试与迁移, 默认值即金利来现网配置。
 """
 import os
 import re
@@ -35,56 +44,81 @@ import subprocess
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, unquote
 
-REC_DIR = "/mnt/nvr/recordings"
-LOG_DIR = "/mnt/nvr/logs"
-BASE_DIR = "/mnt/nvr"
-HLS_ROOT = "/mnt/nvr/hls"
 
-# 实时预览参数
-#
-# CPU 实测(RK3399 软编, 单路 800x448 输入):
-#   ultrafast crf23(旧)      112%   <- 4 路 = 448%
-#   veryfast  crf26          92%
-#   veryfast  crf26 + 12fps   81%   <- 当前采用, 4 路 = 324%
-#   640x360 + 12fps           70%
-# 监控画面不需要高帧率, 12fps 完全够看(动作略糊但静止清晰)。
-# 配合 MAX_STREAMS=4, 4 路预览约占 324%, 加上 10 路零转码录制也还有余量。
-MAX_STREAMS = 4          # 全局同时转码路数上限(留CPU 余量, 不能再高)
-SLICE_SEC = 4            # 每个 HLS 切片秒数(太小会让切片滚动过快, 播放器追不上而黑屏)
-PREVIEW_W, PREVIEW_H = 800, 448   # 子码流实际分辨率(2026-10-03 相机端已改)
-# 子码流原生就是 16:9 (800x448 = 1.7857, 与 16:9 差 0.45%)。
-# 输入已等于目标尺寸, **不要加 scale 滤镜** —— 那会白白吃掉 CPU。
-# 万一将来相机又改成别的分辨率, 去掉 scale 也只是保留原始尺寸, 不会变形。
-PREVIEW_FPS = 12         # 降帧是省 CPU 最有效的一招(省 28%)
-PREVIEW_PRESET = "veryfast"   # ultrafast 虽然更快但画质差且并不省 CPU(实测 112% vs 92%)
-PREVIEW_CRF = "26"       # 画质/体积平衡点, 监控场景 crf23->26 肉眼几乎无差别
-HLS_LIST = 20            # m3u8 保留切片数 (20 x 4s = 80 秒缓冲, 足够浏览器追赶)
-IDLE_TIMEOUT = 60        # 无客户端后自动停止转码
+def _env_int(name, default):
+    try:
+        return int(os.environ.get(name, "").strip())
+    except Exception:
+        return default
 
-os.makedirs(HLS_ROOT, exist_ok=True)
 
-# 摄像头定义(与录制脚本保持一致)
-CAMERAS = [
-    {"name": "Camera1",  "ip": "192.168.1.21", "label": "Camera 1", "zone": "入口"},
-    {"name": "Camera2",  "ip": "192.168.1.22", "label": "Camera 2", "zone": "走廊"},
-    {"name": "Camera3",  "ip": "192.168.1.23", "label": "Camera 3", "zone": "教室A"},
-    {"name": "Camera4",  "ip": "192.168.1.24", "label": "Camera 4", "zone": "教室 B"},
-    # Camera5-8 是另一厂家: 需要 RTSP 认证, 且子码流在 /stream2 而非根路径
-    {"name": "Camera5",  "ip": "192.168.1.25", "label": "Camera 5", "zone": "教室 C",
-     "user": "admin", "pass": "YOUR_CAM_PASSWORD", "sub": "/stream2"},
-    {"name": "Camera6",  "ip": "192.168.1.26", "label": "Camera 6", "zone": "教室 D",
-     "user": "admin", "pass": "YOUR_CAM_PASSWORD", "sub": "/stream2"},
-    {"name": "Camera7",  "ip": "192.168.1.27", "label": "Camera 7", "zone": "创客区",
-     "user": "admin", "pass": "YOUR_CAM_PASSWORD", "sub": "/stream2"},
-    {"name": "Camera8",  "ip": "192.168.1.28", "label": "Camera 8", "zone": "讨论区",
-     "user": "admin", "pass": "YOUR_CAM_PASSWORD", "sub": "/stream2"},
-    {"name": "Camera9",  "ip": "192.168.1.29", "label": "Camera 9", "zone": "外摆台"},
-    # Camera10 与 .21-.24 同款: 无认证, 子码流在根路径 /(无需 user/sub 字段)
-    {"name": "Camera10", "ip": "192.168.1.30", "label": "Camera 10", "zone": "后仓"},
-]
+# ---------------- 路径 ----------------
+BASE_DIR = os.environ.get("NVR_BASE", "/mnt/nvr")
+REC_DIR = os.path.join(BASE_DIR, "recordings")
+LOG_DIR = os.path.join(BASE_DIR, "logs")
+HLS_ROOT = os.path.join(BASE_DIR, "hls")
+STATE_DIR = os.path.join(BASE_DIR, "state")
+
+# ---------------- 摄像头清单(与录制脚本保持一致) ----------------
+# 金利来两批摄像头: .21-.24/.29/.30 无认证、子码流在根路径 /;
+#                  .25-.28 需认证 admin/密码、子码流在 /stream2
+CAMERAS_JSON = os.environ.get("NVR_CAMERAS_JSON", "").strip()
+if CAMERAS_JSON:
+    CAMERAS = json.loads(CAMERAS_JSON)
+else:
+    CAMERAS = [
+        {"name": "Camera1",  "ip": "192.168.1.21", "label": "Camera 1", "zone": "入口"},
+        {"name": "Camera2",  "ip": "192.168.1.22", "label": "Camera 2", "zone": "走廊"},
+        {"name": "Camera3",  "ip": "192.168.1.23", "label": "Camera 3", "zone": "教室A"},
+        {"name": "Camera4",  "ip": "192.168.1.24", "label": "Camera 4", "zone": "教室 B"},
+        # Camera5-8 是另一厂家: 需要 RTSP 认证, 且子码流在 /stream2 而非根路径
+        {"name": "Camera5",  "ip": "192.168.1.25", "label": "Camera 5", "zone": "教室 C",
+         "user": "admin", "pass": "YOUR_CAM_PASSWORD", "sub": "/stream2"},
+        {"name": "Camera6",  "ip": "192.168.1.26", "label": "Camera 6", "zone": "教室 D",
+         "user": "admin", "pass": "YOUR_CAM_PASSWORD", "sub": "/stream2"},
+        {"name": "Camera7",  "ip": "192.168.1.27", "label": "Camera 7", "zone": "创客区",
+         "user": "admin", "pass": "YOUR_CAM_PASSWORD", "sub": "/stream2"},
+        {"name": "Camera8",  "ip": "192.168.1.28", "label": "Camera 8", "zone": "讨论区",
+         "user": "admin", "pass": "YOUR_CAM_PASSWORD", "sub": "/stream2"},
+        {"name": "Camera9",  "ip": "192.168.1.29", "label": "Camera 9", "zone": "外摆台"},
+        # Camera10 与 .21-.24 同款: 无认证, 子码流在根路径 /(无需 user/sub 字段)
+        {"name": "Camera10", "ip": "192.168.1.30", "label": "Camera 10", "zone": "后仓"},
+    ]
 
 CAM_MAP = {c["name"]: c for c in CAMERAS}
 SEG_RE = re.compile(r"^(?P<cam>[A-Za-z]+\d+)_(?P<date>\d{8})_(?P<time>\d{6})\.mp4$")
+
+# ---------------- 预览参数 ----------------
+# 模式: copy=零转码直通(仅 H.264 子码流), hw=VPU 硬编, sw=libx264 软编
+MODE_COPY, MODE_HW, MODE_SW = "copy", "hw", "sw"
+MODE_LABEL = {"copy": "直通", "hw": "硬编", "sw": "软编"}
+
+MAX_SW_STREAMS = _env_int("NVR_MAX_SW", 4)    # 软编并发(RK3399 实测 4 路约 324% CPU)
+MAX_HW_STREAMS = _env_int("NVR_MAX_HW", 8)    # 硬编并发(VPU 编码能力余量大)
+MAX_TOTAL = _env_int("NVR_MAX_TOTAL", 12)     # 总并发兜底(含直通)
+
+SLICE_SECS = {"copy": 2, "hw": 3, "sw": 4}          # HLS 切片秒数(越小延迟越低)
+HLS_LISTS = {"copy": 8, "hw": 8, "sw": 20}          # m3u8 保留切片数
+IDLE_TIMEOUTS = {"copy": 120, "hw": 90, "sw": 60}   # 无客户端后自动停(秒)
+
+# 软编参数(与旧版一致, 实测单路约 81% CPU):
+PREVIEW_FPS = 12         # 降帧是省 CPU 最有效的一招(省 28%)
+PREVIEW_PRESET = "veryfast"
+PREVIEW_CRF = "26"
+# 硬编参数:
+HW_BITRATE = "1500k"
+HW_FPS = 15
+
+PROBE_TTL = _env_int("NVR_PROBE_TTL", 6 * 3600)   # 探测结果缓存时长(秒)
+PROBE_TIMEOUT = 10                                 # 单路 ffprobe 超时(RTSP 不会自己结束)
+
+# 板子能力(启动时探测):
+#   hw_enc   —— h264_v4l2m2m 编码器存在且实测可用
+#   hevc_dec —— hevc_v4l2m2m 硬解码器存在(RK3399 rkvdec)
+CAPS = {"hw_enc": False, "hevc_dec": False, "ffmpeg": None, "checked": False}
+
+for _d in (HLS_ROOT, STATE_DIR, LOG_DIR):
+    os.makedirs(_d, exist_ok=True)
 
 
 def log(msg):
@@ -96,7 +130,126 @@ def log(msg):
 
 
 # ============================================================
-# 实时预览: 每路一个按需启动 / 空闲自停的转码进程
+# 能力探测: 这台板子能不能硬编(只跑一次)
+# ============================================================
+def _ffmpeg_has(section, name):
+    try:
+        r = subprocess.run(["ffmpeg", "-hide_banner", "-" + section],
+                           capture_output=True, text=True, timeout=15)
+        return re.search(r"\b%s\b" % re.escape(name), r.stdout) is not None
+    except Exception:
+        return False
+
+
+def _hw_encode_works():
+    """实测一次硬编: lavfi 测试源 -> h264_v4l2m2m -> null。
+    ffmpeg 4.2.7 对 RK3399 的 multiplanar 编码节点支持不全,
+    只列在 -encoders 里但一用就报 'Could not find a valid device'。
+    """
+    try:
+        r = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error",
+             "-f", "lavfi", "-i", "testsrc=size=640x360:rate=10:duration=1",
+             "-c:v", "h264_v4l2m2m", "-f", "null", "-"],
+            capture_output=True, text=True, timeout=20)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def detect_caps():
+    try:
+        r = subprocess.run(["ffmpeg", "-hide_banner", "-version"],
+                           capture_output=True, text=True, timeout=15)
+        m = re.search(r"ffmpeg version (\S+)", r.stdout or "")
+        CAPS["ffmpeg"] = m.group(1) if m else None
+    except Exception:
+        pass
+    CAPS["hevc_dec"] = _ffmpeg_has("decoders", "hevc_v4l2m2m")
+    CAPS["hw_enc"] = _ffmpeg_has("encoders", "h264_v4l2m2m") and _hw_encode_works()
+    CAPS["checked"] = True
+    log("能力探测: ffmpeg=%s 硬编=%s HEVC硬解=%s" % (
+        CAPS["ffmpeg"], "可用" if CAPS["hw_enc"] else "不可用",
+        "有" if CAPS["hevc_dec"] else "无"))
+
+
+# ============================================================
+# 子码流探测: 逐台 ffprobe, 结果缓存(相机端改编码后缓存要失效)
+# ============================================================
+def _probe_path(name):
+    return os.path.join(STATE_DIR, "probe_%s.json" % name)
+
+
+def probe_substream(cam):
+    """探测子码流编码/分辨率/帧率。RTSP 不会自己结束, 必须超时强杀。"""
+    url = sub_url(cam)
+    cmd = ["ffprobe", "-hide_banner", "-loglevel", "error"]
+    if url.startswith("rtsp://"):
+        cmd += ["-rtsp_transport", "tcp", "-stimeout", "5000000"]
+    cmd += ["-select_streams", "v:0",
+            "-show_entries", "stream=codec_name,width,height,avg_frame_rate",
+            "-of", "json", url]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=PROBE_TIMEOUT)
+        j = json.loads(r.stdout or "{}")
+        st = (j.get("streams") or [{}])[0]
+        if not st.get("codec_name"):
+            return None
+        return {"codec": st["codec_name"],
+                "width": st.get("width"), "height": st.get("height"),
+                "fps": st.get("avg_frame_rate"), "ts": int(time.time())}
+    except Exception:
+        return None
+
+
+def get_probe(name, lazy=False):
+    """取探测结果(缓存 6 小时)。lazy=True 时缓存失效就现探(会阻塞)。"""
+    p = _probe_path(name)
+    try:
+        with open(p) as fh:
+            info = json.load(fh)
+        if time.time() - info.get("ts", 0) < PROBE_TTL:
+            return info
+    except Exception:
+        pass
+    if not lazy:
+        return None
+    info = probe_substream(CAM_MAP[name])
+    if info:
+        save_probe(name, info)
+    return info
+
+
+def save_probe(name, info):
+    try:
+        with open(_probe_path(name), "w") as fh:
+            json.dump(info, fh)
+    except Exception:
+        pass
+
+
+def invalidate_probe(name):
+    try:
+        os.remove(_probe_path(name))
+    except OSError:
+        pass
+
+
+def choose_mode(cam, info):
+    """按探测结果选模式。没有探测结果时保守用软编(旧行为)。"""
+    if not info:
+        return MODE_SW
+    codec = (info.get("codec") or "").lower()
+    if codec == "h264":
+        return MODE_COPY
+    if codec == "hevc" and CAPS["hw_enc"] and CAPS["hevc_dec"]:
+        return MODE_HW
+    return MODE_SW
+
+
+# ============================================================
+# 实时预览: 每路一个按需启动 / 空闲自停的 remux 或转码进程
 # ============================================================
 class LiveStream:
     def __init__(self, cam):
@@ -105,60 +258,60 @@ class LiveStream:
         self.dir = os.path.join(HLS_ROOT, self.name)
         self.proc = None
         self.lock = threading.Lock()
-        self.clients = 0
         self.last_used = time.time()
         self.starting = False
-        self.ever_started = False
+        self.mode = None            # 本次启动使用的模式
+        self.started_at = 0.0
+        self.ever_ready = False     # 是否曾经产出过切片
+        self.fail_marks = 0         # 连续启动失败次数(日志限流用)
 
     @property
     def running(self):
         return self.proc is not None and self.proc.poll() is None
 
+    def _slot_ok(self, mode):
+        if active_count() >= MAX_TOTAL:
+            return False
+        if mode == MODE_SW and mode_count(MODE_SW) >= MAX_SW_STREAMS:
+            return False
+        if mode == MODE_HW and mode_count(MODE_HW) >= MAX_HW_STREAMS:
+            return False
+        return True
+
     def start(self):
+        """启动(或已在启动中)返回 True; 因并发名额被拒返回 False。"""
         with self.lock:
             if self.running or self.starting:
-                return
-            if active_count() >= MAX_STREAMS:
-                log("并发已满(%d), 暂不启动 %s" % (MAX_STREAMS, self.name))
-                return
+                return True
+            # 现探(缓存过期或从未探测过); 探测失败按软编走, 不影响旧体验
+            info = get_probe(self.name, lazy=True)
+            mode = choose_mode(self.cam, info)
+            if not self._slot_ok(mode):
+                log("并发已满(软编 %d/%d, 总 %d/%d), 暂不启动 %s" % (
+                    mode_count(MODE_SW), MAX_SW_STREAMS,
+                    active_count(), MAX_TOTAL, self.name))
+                return False
             self.starting = True
             try:
                 shutil.rmtree(self.dir, ignore_errors=True)
                 os.makedirs(self.dir, exist_ok=True)
                 m3u8 = os.path.join(self.dir, "index.m3u8")
-                cmd = [
-                    "ffmpeg", "-hide_banner", "-loglevel", "warning",
-                    "-rtsp_transport", "tcp",
-                    "-stimeout", "10000000",
-                    "-i", sub_url(self.cam),   # 认证与路径由 sub_url 按厂家处理
-                    "-an", "-sn", "-dn",
-                    # 不加 -vf scale: 输入已是 800x448, 缩放只会白吃 CPU
-                    # 降帧 + 降 crf + 换 preset, 三者叠加省掉约 28% CPU(实测 112% -> 81%)
-                    "-r", str(PREVIEW_FPS),
-                    "-c:v", "libx264", "-preset", PREVIEW_PRESET,
-                    "-tune", "zerolatency",
-                    "-profile:v", "baseline", "-level", "3.1",
-                    "-pix_fmt", "yuv420p",
-                    "-crf", PREVIEW_CRF, "-bf", "0", "-g", "50",
-                    "-f", "hls",
-                    "-hls_time", str(SLICE_SEC),
-                    "-hls_list_size", str(HLS_LIST),
-                    # program_date_time: 让播放器能做精确的时间轴对齐,
-                    #   缺了它 hls.js 只能靠序号推算, 遇到切片滚动就会反复重同步失败(黑屏)
-                    # omit_endlist: 直播流必须带, 否则播放器会认为流已结束而停住
-                    "-hls_flags", "delete_segments+append_list+omit_endlist+independent_segments+program_date_time",
-                    "-hls_segment_filename", os.path.join(self.dir, "seg_%06d.ts"),
-                    m3u8,
-                ]
+                cmd = build_cmd(self.cam, mode, self.dir, m3u8)
                 self.proc = subprocess.Popen(
                     cmd, stdout=subprocess.DEVNULL,
                     stderr=open(os.path.join(LOG_DIR, "live_%s.log" % self.name), "a"))
-                self.ever_started = True
-                log("启动实时转码 %s (%s)" % (self.name, self.cam["ip"]))
+                self.mode = mode
+                self.started_at = time.time()
+                self.ever_ready = False
+                log("启动实时%s %s (%s, 子码流 %s)" % (
+                    MODE_LABEL.get(mode, mode), self.name, self.cam["ip"],
+                    (info or {}).get("codec", "未知")))
             except Exception as e:
                 log("启动失败 %s: %s" % (self.name, e))
+                return False
             finally:
                 self.starting = False
+            return True
 
     def stop(self):
         with self.lock:
@@ -178,13 +331,13 @@ class LiveStream:
             self.last_used = time.time()
 
     def untouch(self):
-        # 兼容前端调用: 立即判定为空闲, 由 reaper 回收
         with self.lock:
             self.last_used = 0
 
     def idle(self):
         with self.lock:
-            return (time.time() - self.last_used) > IDLE_TIMEOUT
+            t = IDLE_TIMEOUTS.get(self.mode, 60)
+            return (time.time() - self.last_used) > t
 
     def playlist_ready(self):
         """m3u8 已有内容(至少一个切片写完)才算就绪"""
@@ -192,9 +345,55 @@ class LiveStream:
         if not os.path.isfile(p):
             return False
         try:
-            return os.path.getsize(p) > 20
+            ok = os.path.getsize(p) > 20
         except OSError:
             return False
+        if ok:
+            self.ever_ready = True
+        return ok
+
+
+def build_cmd(cam, mode, out_dir, m3u8):
+    """按模式构造 ffmpeg 命令。"""
+    url = sub_url(cam)
+    tail = [
+        "-an", "-sn", "-dn",
+        "-f", "hls",
+        "-hls_time", str(SLICE_SECS.get(mode, 4)),
+        "-hls_list_size", str(HLS_LISTS.get(mode, 20)),
+        # program_date_time: 让播放器能做精确的时间轴对齐,
+        #   omit_endlist: 直播流必须带, 否则播放器会认为流已结束而停住
+        "-hls_flags", "delete_segments+append_list+omit_endlist+independent_segments+program_date_time",
+        "-hls_segment_filename", os.path.join(out_dir, "seg_%06d.ts"),
+        m3u8,
+    ]
+    head = ["ffmpeg", "-hide_banner", "-loglevel", "warning"]
+    if url.startswith("rtsp://"):
+        head += ["-rtsp_transport", "tcp", "-stimeout", "10000000"]
+    head += ["-i", url]
+    if mode == MODE_COPY:
+        # 子码流本来就是 H.264: 直接 remux, 不重编码, 单路 CPU 约 2-5%
+        # 输入已是目标尺寸与帧率, 不加 -r / -vf scale, 一点不多花 CPU
+        return head + ["-map", "0:v:0", "-c:v", "copy"] + tail
+    if mode == MODE_HW:
+        # HEVC 子码流: rkvdec 硬解 + VPU 硬编 H.264
+        hw_head = ["ffmpeg", "-hide_banner", "-loglevel", "warning",
+                   "-c:v", "hevc_v4l2m2m"]
+        if url.startswith("rtsp://"):
+            hw_head += ["-rtsp_transport", "tcp", "-stimeout", "10000000"]
+        return hw_head + ["-i", url,
+                          "-map", "0:v:0",
+                          "-c:v", "h264_v4l2m2m",
+                          "-b:v", HW_BITRATE, "-g", "40", "-bf", "0",
+                          "-r", str(HW_FPS), "-pix_fmt", "yuv420p"] + tail
+    # 软编(旧参数, 单路约 81% CPU)
+    return head + ["-map", "0:v:0",
+                   "-r", str(PREVIEW_FPS),
+                   "-c:v", "libx264", "-preset", PREVIEW_PRESET,
+                   "-tune", "zerolatency",
+                   "-profile:v", "baseline", "-level", "3.1",
+                   "-pix_fmt", "yuv420p",
+                   "-crf", PREVIEW_CRF, "-bf", "0", "-g", "50"] + tail
 
 
 LIVE = {c["name"]: LiveStream(c) for c in CAMERAS}
@@ -204,78 +403,79 @@ def active_count():
     return sum(1 for s in LIVE.values() if s.running)
 
 
-# ---------- 分组轮转调度 ----------
-#
-# 背景: 板子软编 4 路预览就占约 324% CPU(600% 上限), 10 路不可能同时开。
-# 但"分 2 组轮流"本身并不省 CPU —— 10 路都在看时总转码量不变。
-# 真正的价值在于:
-#   1. 用户滚动浏览九宫格时, 后面没启动的组会自动顶上, 不用手动点
-#   2. 停留在一组时, 另一组完全空闲, CPU 只服务当前关注的 4 路
-#
-# 所以这里做的不是"定时强转", 而是"空闲时轮换"——
-# 有客户端观看的组优先, 只有当所有组都空闲时才切换。
-PREVIEW_GROUPS = 2       # 10 路分几组轮转
-GROUP_SEC = 45# 每组至少停留多久(太短会让人觉得画面在闪)
-
-# 每组一次能放几路 = MAX_STREAMS
-_group_idx = {"cur": 0, "at": 0.0}
+def mode_count(mode):
+    return sum(1 for s in LIVE.values() if s.running and s.mode == mode)
 
 
-def group_of_name(name):
-    """按摄像头名字判断属于第几组(0 起)。
-    ⚠️ LIVE 是 {name: LiveStream} 的字典, 键是名字不是索引 ——
-       曾经写成 group_of(i) 传进 name 当模数, 导致 reaper 抛
-       "not all arguments converted during string formatting" 而整个挂掉。
-    """
-    for i, c in enumerate(CAMERAS):
-        if c["name"] == name:
-            return i % PREVIEW_GROUPS
-    return 0
-
-
-def rotate_if_idle():
-    """所有组都没有活跃客户端时, 轮转到下一组。
-    有客户端在看的那一组不会被抢 —— 那是用户真正关心的画面。
-    """
-    cur = _group_idx["cur"]
-    busy_groups = set()
-    for name, s in LIVE.items():
-        if s.running and not s.idle():
-            busy_groups.add(group_of_name(name))
-    if busy_groups:
-        # 有人在看, 就不动
-        if cur not in busy_groups:
-            # 让当前组对齐到有人在看的那组, 保证 MAX_STREAMS 额度不被空转占用
-            _group_idx["cur"] = min(busy_groups)
-        return
-    nxt = (cur + 1) % PREVIEW_GROUPS
-    if nxt == 0 and time.time() - _group_idx["at"] < GROUP_SEC:
-        return
-    _group_idx["cur"] = nxt
-    _group_idx["at"] = time.time()
-    names = [c["name"] for i, c in enumerate(CAMERAS)
-             if i % PREVIEW_GROUPS == nxt]
-    log("轮转到第 %d 组: %s" % (nxt + 1, ", ".join(names)))
-
-
+# ============================================================
+# 守护: 空闲回收 + 失败处理(硬编整体回退 / 直通重新探测)
+# ============================================================
 def reaper_loop():
     # 这个守护负责回收空闲转码, 挂了就再也不会释放 CPU,
     # 所以异常必须让进程退出并被 systemd 重启, 而不是静默死掉。
     while True:
         time.sleep(10)
-        for s in LIVE.values():
-            if s.running and s.idle():
-                log("空闲超时, 关闭 %s" % s.name)
-                s.stop()
-        rotate_if_idle()
+        try:
+            for s in LIVE.values():
+                if s.running:
+                    if s.idle():
+                        log("空闲超时, 关闭 %s" % s.name)
+                        s.stop()
+                    continue
+                # 进程已退出: 从未产出过切片才算"启动失败"
+                # (相机离线 / 子码流编码不符 / 硬编挂死)
+                if s.proc is not None and not s.ever_ready:
+                    s.fail_marks += 1
+                    # 离线摄像头会反复触发, 日志限流: 前 3 次 + 之后每 10 次记一条
+                    if s.fail_marks <= 3 or s.fail_marks % 10 == 0:
+                        log("%s 启动失败(从未产出切片, 第 %d 次, 模式=%s)" % (
+                            s.name, s.fail_marks, s.mode))
+                    if s.mode == MODE_HW:
+                        CAPS["hw_enc"] = False   # 硬编全局不可信, 回退软编
+                        log("硬编链路异常, 已全局回退软编")
+                    elif s.mode == MODE_COPY and s.fail_marks <= 3:
+                        # 可能相机端改过编码(如 H.264->H.265),
+                        # 失效缓存下次重新探测(同样限流, 避免离线摄像头反复重探)
+                        invalidate_probe(s.name)
+                        log("直通失败, 已失效 %s 探测缓存, 下次启动重新探测" % s.name)
+                s.proc = None
+        except Exception as e:
+            log("reaper 异常: %s" % e)
+
+
+# ============================================================
+# 启动: 能力探测 -> 逐路探测子码流 -> 预热直通流
+# ============================================================
+def init_worker():
+    detect_caps()
+    for c in CAMERAS:
+        if not CAPS["checked"]:
+            break
+        info = probe_substream(c)
+        if info:
+            save_probe(c["name"], info)
+        time.sleep(1.0)   # 错开探测, 避免同时开太多 RTSP 连接
+    modes = {}
+    for c in CAMERAS:
+        m = choose_mode(c, get_probe(c["name"]))
+        modes[c["name"]] = m
+    log("子码流探测完成: " + ", ".join(
+        "%s=%s" % (n, MODE_LABEL.get(m, m)) for n, m in modes.items()))
+    # 直通几乎不花 CPU, 启动即预热, 打开页面无需等待
+    for c in CAMERAS:
+        if modes.get(c["name"]) == MODE_COPY:
+            LIVE[c["name"]].start()
 
 
 def sub_url(cam):
     """按摄像头构造子码流 RTSP URL。
     两批摄像头厂家不同:
       .21-.24  无认证, 子码流在根路径 /
-      .25-.28  需认证 admin/YOUR_CAM_PASSWORD, 子码流在 /stream2
+      .25-.28  需认证 admin/密码, 子码流在 /stream2
+    带 src 字段时直接用给定 URL(测试或特殊源)。
     """
+    if cam.get("src"):
+        return cam["src"]
     path = cam.get("sub", "/")
     if cam.get("user"):
         return "rtsp://%s:%s@%s:554%s" % (
@@ -322,7 +522,6 @@ def mem_info():
                 d[k] = float(v.split()[0]) * 1024
         total = d.get("MemTotal", 0)
         avail = d.get("MemAvailable", d.get("MemFree", 0))
-        # 缓存+回收 buffer 算"已用", 与 free 命令一致
         used = total - avail
         return {
             "total_gb": round(total / 1024**3, 2),
@@ -342,7 +541,7 @@ def temp_info():
         t = _readf(z, -1)
         if t < 0:
             continue
-        t = t / 1000.0 if t > 1000 else t   # 有些驱动已经是摄氏度
+        t = t / 1000.0 if t > 1000 else t
         name = z.split("thermal_zone")[-1].split("/")[0]
         if best is None or t > best["c"]:
             best = {"c": round(t, 1), "zone": name}
@@ -377,8 +576,6 @@ def sys_info():
         sys_info._prev_cpu = (ct, time.time())
         if prev:
             p, pnow = prev
-            # /proc/stat 各字段含义: 0 user 1 nice 2 system 3 idle 4 iowait
-            # 5 irq 6 softirq 7 steal。总计 = 全部之和, 空闲 = idle + iowait
             dt = sum(ct) - sum(p)
             idle = (ct[3] - p[3]) + (ct[4] - p[4])
             if dt > 0:
@@ -397,10 +594,11 @@ def sys_info():
     ncpu = os.cpu_count() or 1
     d = disk_info()
     return {
-        "cpu_pct": cpu_pct,                 # None = 首次采样, 下一帧才有
+        "cpu_pct": cpu_pct,
         "ncpu": ncpu,
         "load1": round(load1, 2),
         "load5": round(load5, 2),
+        "load15": round(load15, 2),
         "load_per_core": round(load1 / ncpu, 2),
         "mem": mem_info(),
         "temp": temp_info(),
@@ -408,18 +606,19 @@ def sys_info():
         "uptime_s": int(up),
         "disk": d,
         "streams": active_count(),
-        "max_streams": MAX_STREAMS,
+        "max_streams": MAX_SW_STREAMS,
+        "stream_modes": {"copy": mode_count(MODE_COPY),
+                         "hw": mode_count(MODE_HW),
+                         "sw": mode_count(MODE_SW)},
+        "caps": {"hw_enc": CAPS["hw_enc"], "ffmpeg": CAPS["ffmpeg"]},
     }
 
 
 def disk_info():
     st = os.statvfs(BASE_DIR)
-    # 与 df 的 Use% 保持一致的口径:
-    #   used = total - f_bfree  (f_bfree 才是"已用", f_bavail 是"普通用户可用")
-    #   展示剩余空间用 f_bavail (root 保留块用户看不到, 不能算进去)
     total = st.f_blocks * st.f_frsize
-    free = st.f_bfree * st.f_frsize          # 真正空闲
-    avail = st.f_bavail * st.f_frsize        # 用户可用
+    free = st.f_bfree * st.f_frsize
+    avail = st.f_bavail * st.f_frsize
     used = total - free
     return {
         "total_gb": round(total / 1024**3, 1),
@@ -437,7 +636,6 @@ def cam_status(name):
     files = [f for f in os.listdir(d) if f.endswith(".mp4")]
     if not files:
         return "offline"
-    # 分片 mtime 在 90 秒内 => 正在录
     newest = max(os.path.getmtime(os.path.join(d, f)) for f in files)
     if time.time() - newest < 90:
         return "recording"
@@ -465,7 +663,6 @@ def list_segments(cam, date=None):
             continue
         rows.append((f, m, stt))
     rows.sort(key=lambda r: r[2].st_mtime)
-    # 该路最新的分片 = 唯一可能正在写入的那个
     newest_name = rows[-1][0] if rows else None
 
     out = []
@@ -477,9 +674,6 @@ def list_segments(cam, date=None):
             "size_mb": round(stt.st_size / 1024**2, 1),
             "mtime": int(stt.st_mtime),
             "ts": int(stt.st_mtime),
-            # 正在写入的分片: mp4 的 moov 尚未落盘, 播放器打不开。
-            # 不能只看"距今多久" —— 刚闭合的分片 mtime 也很新, 会被误判。
-            # 正确判据: 该路最新的分片, 且仍在增长。
             "live": f == newest_name and (time.time() - stt.st_mtime) < 3,
         })
     return out
@@ -532,11 +726,37 @@ def probe_file(path):
         return {}
 
 
+def live_api():
+    cams = []
+    for c in CAMERAS:
+        s = LIVE[c["name"]]
+        info = get_probe(c["name"])
+        cams.append({
+            **c,
+            "streaming": s.running,
+            "mode": s.mode if s.running else choose_mode(c, info),
+            "codec": (info or {}).get("codec"),
+            "clients": 0,
+            "ready": s.playlist_ready(),
+        })
+    return {
+        "cameras": cams,
+        "active_streams": active_count(),
+        "stream_modes": {"copy": mode_count(MODE_COPY),
+                         "hw": mode_count(MODE_HW),
+                         "sw": mode_count(MODE_SW)},
+        "max_streams": MAX_SW_STREAMS,
+        "max_hw_streams": MAX_HW_STREAMS,
+        "max_total": MAX_TOTAL,
+        "slice_sec": SLICE_SECS["sw"],
+        "caps": {"hw_enc": CAPS["hw_enc"], "ffmpeg": CAPS["ffmpeg"]},
+    }
+
+
 class Handler(BaseHTTPRequestHandler):
-    server_version = "NVR/1.0"
+    server_version = "NVR/1.1"
 
     def log_message(self, fmt, *args):
-        # 静默常规访问日志, 只记录错误
         pass
 
     def _json(self, obj, code=200):
@@ -555,7 +775,6 @@ class Handler(BaseHTTPRequestHandler):
         if not os.path.isfile(p):
             return self._err("文件不存在", 404)
         size = os.path.getsize(p)
-        # HLS 切片持续追加/删除, 必须 no-store; 静态资源则可长缓存
         self.send_response(200)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(size))
@@ -575,20 +794,22 @@ class Handler(BaseHTTPRequestHandler):
                     return self._err("未知摄像头: %s" % cam)
                 s = LIVE[cam]
                 s.touch()
-                s.start()
+                if not s.start() and not s.running:
+                    # 名额已满: 明确告诉前端"是排队不是故障", 前端会自动重试
+                    return self._json({
+                        "status": "busy", "cam": cam,
+                        "reason": "转码名额已满(软编 %d/%d)" % (
+                            mode_count(MODE_SW), MAX_SW_STREAMS)}, 429)
                 if not s.playlist_ready():
                     return self._json({"status": "starting", "cam": cam}, 202)
                 # 必须把 m3u8 里的相对切片名改成绝对路径。
-                # ffmpeg 写的是 "seg_000006.ts", 播放器会以 m3u8 的 URL(/live?cam=X)
-                # 为基准解析, 结果请求到根路径 /seg_000006.ts -> 404 -> 一直黑屏。
                 with open(os.path.join(s.dir, "index.m3u8")) as fh:
                     txt = fh.read()
                 txt = re.sub(r"(?m)^(seg_\d+\.ts)$",
                              r"/hls/%s/\1" % cam, txt)
                 body = txt.encode("utf-8")
                 self.send_response(200)
-                self.send_header("Content-Type",
-                                 "application/x-mpegURL")
+                self.send_header("Content-Type", "application/x-mpegURL")
                 self.send_header("Content-Length", str(len(body)))
                 self.send_header("Cache-Control", "no-store, no-cache")
                 self.end_headers()
@@ -597,7 +818,6 @@ class Handler(BaseHTTPRequestHandler):
 
             if u.path.startswith("/hls/"):
                 parts = [p for p in u.path.split("/") if p]
-                # /hls/<cam>/seg_000001.ts
                 if len(parts) != 3:
                     return self._err("路径错误", 404)
                 cam, fn = parts[1], parts[2]
@@ -613,7 +833,6 @@ class Handler(BaseHTTPRequestHandler):
                 cam = q.get("cam", [""])[0]
                 if cam in LIVE:
                     if q.get("force", ["0"])[0] == "1":
-                        # 强制立即关闭, 不等空闲超时
                         LIVE[cam].last_used = 0
                         LIVE[cam].stop()
                     else:
@@ -621,17 +840,21 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"ok": True})
 
             if u.path == "/api/live":
-                return self._json({
-                    "cameras": [{
-                        **c,
-                        "streaming": LIVE[c["name"]].running,
-                        "clients": LIVE[c["name"]].clients,
-                        "ready": LIVE[c["name"]].playlist_ready(),
-                    } for c in CAMERAS],
-                    "active_streams": active_count(),
-                    "max_streams": MAX_STREAMS,
-                    "slice_sec": SLICE_SEC,
-                })
+                return self._json(live_api())
+
+            # 相机端改过编码后调用: 失效探测缓存 + 停掉在放的流, 下次自动重新探测
+            if u.path == "/api/reprobe":
+                def _job():
+                    for c in CAMERAS:
+                        invalidate_probe(c["name"])
+                        LIVE[c["name"]].stop()
+                        info = probe_substream(c)
+                        if info:
+                            save_probe(c["name"], info)
+                        time.sleep(1.0)
+                    log("手动重新探测完成")
+                threading.Thread(target=_job, daemon=True).start()
+                return self._json({"ok": True, "msg": "已在后台重新探测全部子码流"})
 
             if u.path == "/api/ping":
                 return self._json({"cameras": [
@@ -641,10 +864,9 @@ class Handler(BaseHTTPRequestHandler):
             if u.path == "/api/sysinfo":
                 return self._json(sys_info())
 
-            # ---------- 静态资源(本地 hls.js 与 logo, 不依赖公网 CDN) ----------
+            # ---------- 静态资源 ----------
             if u.path.startswith("/static/"):
                 fn = os.path.basename(u.path)
-                # 白名单, 避免任意文件读取
                 if fn not in ("hls.min.js", "logo-light.png", "favicon-32.png",
                               "favicon-64.png", "favicon-512.png",
                               "apple-touch-icon.png"):
@@ -655,8 +877,7 @@ class Handler(BaseHTTPRequestHandler):
                     return self._err("资源未部署: %s" % fn, 404)
                 ctype = ("application/javascript; charset=utf-8"
                          if fn.endswith(".js") else "image/png")
-                return self._send_file(p, ctype,
-                                       "public, max-age=86400")
+                return self._send_file(p, ctype, "public, max-age=86400")
 
             # ---------- 录像查询 ----------
             if u.path == "/api/overview":
@@ -668,9 +889,6 @@ class Handler(BaseHTTPRequestHandler):
                 if cam not in CAM_MAP:
                     return self._err("未知摄像头: %s" % cam)
                 segs = list_segments(cam, date)
-                # 逐个 ffprobe 极慢(实测 50 片要 9 秒), 会把整个时间轴卡住。
-                # 所以默认不 probe, 前端只对"当前选中的那一段"按需查详情。
-                # ?probe=1 仅在分片数很少(<=8)时返回, 避免拖慢整页。
                 want = q.get("probe", ["0"])[0] == "1" and len(segs) <= 8
                 if want:
                     for s in segs:
@@ -714,14 +932,11 @@ class Handler(BaseHTTPRequestHandler):
                 cam = q.get("cam", [""])[0]
                 f = os.path.basename(q.get("file", [""])[0])
                 p = os.path.join(REC_DIR, cam, f)
-                # 路径穿越防护
                 if cam not in CAM_MAP or not os.path.isfile(p) \
                         or os.path.dirname(os.path.realpath(p)) != \
                         os.path.realpath(os.path.join(REC_DIR, cam)):
                     return self._err("文件不存在", 404)
 
-                # 正在写入的分片 moov 未落盘, 强行播放必然失败。
-                # 判据与 list_segments 一致: 是该路最新分片且仍在增长。
                 d = os.path.join(REC_DIR, cam)
                 peers = [(x, os.stat(os.path.join(d, x)).st_mtime)
                          for x in os.listdir(d)
@@ -751,8 +966,6 @@ class Handler(BaseHTTPRequestHandler):
                             return
                         e = min(e, size - 1)
                         length = e - s + 1
-                        # 注意: 所有 header 必须在写 body 之前 send 完,
-                        # 否则 BaseHTTPRequestHandler 的缓冲区会把 body 混进响应头, 导致连接中断
                         self.send_response(206)
                         self.send_header("Content-Type", ctype)
                         self.send_header("Content-Length", str(length))
@@ -798,12 +1011,13 @@ def main():
     ap.add_argument("--port", type=int, default=80)
     ap.add_argument("--host", default="0.0.0.0")
     a = ap.parse_args()
-    # 先采一次基线, 否则首次请求拿不到 CPU 占用(需要两次采样做差)
-    sys_info()
+    sys_info()   # 先采基线, 否则首次请求拿不到 CPU 占用
     threading.Thread(target=reaper_loop, daemon=True).start()
+    threading.Thread(target=init_worker, daemon=True).start()
     srv = ThreadingHTTPServer((a.host, a.port), Handler)
     srv.daemon_threads = True
-    log("服务启动 :%d (实时预览并发上限 %d)" % (a.port, MAX_STREAMS))
+    log("服务启动 :%d (直通不占额度, 硬编上限 %d, 软编上限 %d)" % (
+        a.port, MAX_HW_STREAMS, MAX_SW_STREAMS))
     print("NVR service on http://%s:%d" % (a.host, a.port))
     srv.serve_forever()
 

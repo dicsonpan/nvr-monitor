@@ -1,0 +1,11 @@
+# 部署真实配置示例 —— 复制为 deploy.local.conf 后填真实值(该文件已 gitignore, 不会入库)
+# 变量名与 deploy-to-goldlion.sh 顶部的占位符一致
+
+NVR_BOARD_IP="192.168.1.20"                 # 板子 IP
+NVR_SSH_KEY="$HOME/.ssh/id_ed25519"         # SSH 私钥路径
+NVR_LAN_SEG="192.168.1"                     # 校区网段前三段(摄像头 IP = 该段.21-.30)
+NVR_CAM_PASS="YOUR_CAM_PASSWORD"            # 需认证摄像头(.25-.28)的密码
+NVR_SITE_NAME="NVR 监控服务"                 # 服务端标题(写进 nvr-server.py 注释)
+NVR_SITE_TITLE="校区 · 监控中心"             # 页面 <title> 与大标题
+NVR_SITE_DESC="SparkMinds 创智实验室 监控中心"   # 页面 meta description
+NVR_BRAND_ALT="SparkMinds 创智实验室"        # 左上角 logo 的 alt 文案
